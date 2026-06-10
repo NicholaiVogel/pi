@@ -320,16 +320,17 @@ async function stopRecording(ctx: any): Promise<void> {
 // ─── Extension registration ──────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // Space bar = hold to talk
-  pi.registerShortcut("space", {
-    description: "Hold to record voice, release to transcribe",
+  // Right Alt = toggle recording on/off
+  pi.registerShortcut("alt", {
+    description: "Toggle voice dictation (start/stop recording)",
     handler: async (ctx) => {
       if (state.recording) {
         await stopRecording(ctx);
       } else {
         const ok = await startRecording(ctx);
         if (ok) {
-          ctx.ui.setStatus("voice", "🎙 Listening… release Space to transcribe");
+          ctx.ui.setStatus("voice", "🎙 Recording… Right Alt to stop");
+          ctx.ui.notify("🎙 Recording… Right Alt again to stop", "info");
         }
       }
     },
