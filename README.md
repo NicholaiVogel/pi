@@ -22,6 +22,12 @@ And then some I yoinked from [davis7dotsh/my-pi-setup](https://github.com/davis7
 - **yeet** - `/yeet` adds, commits, and pushes in one shot. Ship it.
 - **copy-all** - `/copy-all` copies the full conversation thread to clipboard
 
+And some from [dmmulroy/.dotfiles](https://github.com/dmmulroy/.dotfiles):
+
+- **whimsical** - replaces the thinking spinner with random silly messages like "Negotiating with entropy..." and "Bribing the byte fairies..."
+- **btw** - `/btw` opens a floating side-chat overlay with its own agent session (read/bash/edit/write tools), multi-turn conversations, and summarize-and-inject-back into the main thread
+- **pi-skill-toggle** - `/toggle-skills` discover, enable, and disable skills with an interactive UI
+
 ### Themes
 
 32 themes in `~/.pi/agent/themes/` — select with `/settings`:
