@@ -121,14 +121,10 @@ async function startRecording(): Promise<boolean> {
           const preview = client.transcript;
           if (preview) {
             const needsSpace = state.voicePrefix.length > 0 && !/\s$/.test(state.voicePrefix);
-            const needsTrailing = state.voiceSuffix.length > 0 && !/^\s/.test(state.voiceSuffix);
             const live = state.voicePrefix
               + (needsSpace ? " " : "")
-              + preview
-              + (needsTrailing ? " " : "")
-              + state.voiceSuffix;
+              + preview;
             ctx.ui.setEditorText(live);
-            ctx.ui.setStatus("voice", `🎙 ${preview.slice(-60)}`);
           }
         },
       );

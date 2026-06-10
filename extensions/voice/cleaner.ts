@@ -49,20 +49,24 @@ export function cleanTranscript(raw: string): string {
 
 /**
  * Build an initial_prompt for Whisper that conditions clean output.
- * This isn't instructions — it's text that Whisper continues in the style of.
- * A clean, well-punctuated sentence makes Whisper output clean text.
+ *
+ * IMPORTANT: This is NOT instructions. Whisper treats initial_prompt as
+ * text to CONTINUE from. If you put meta-commentary like "the following
+ * is a clear dictation", Whisper will transcribe that phrase from the
+ * audio or hallucinate it. Use actual clean transcription text instead.
  */
 export function buildInitialPrompt(context?: { editorText?: string }): string {
-  // Base prompt: clean, well-formatted sentence that sets the style
-  const base = "The following is a clear, well-spoken dictation with proper grammar and no filler words.";
+  // Use a short, clean sentence that looks like real transcription output.
+  // Whisper continues in this style — clean, punctuated, no fillers.
+  const base = "Yes, I understand.";
 
-  // If there's existing editor text, append the last few words as context
-  // This helps Whisper continue from where the user left off
+  // If there's existing editor text, use the last few words as context.
+  // This helps Whisper continue from where the user left off.
   if (context?.editorText) {
-    const words = context.editorText.trim().split(/\s+/);
-    const tail = words.slice(-10).join(" ");
-    if (tail) {
-      return `${base} ${tail}`;
+    const words = context.editorText.trim().split(/\s+/).filter(Boolean);
+    const tail = words.slice(-8).join(" ");
+    if (tail && tail.length > 5) {
+      return tail;
     }
   }
 
