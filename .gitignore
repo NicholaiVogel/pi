@@ -1,0 +1,11 @@
+node_modules
+**/node_modules/
+sessions
+auth.json
+trust.json
+run-history.jsonl
+models.json
+settings.json
+mcp-cache.json
+git/
+skills/
