@@ -29,9 +29,30 @@ const HOLD_THRESHOLD = 5;
 const WARMUP_THRESHOLD = 2;
 const RELEASE_TIMEOUT_MS = 600;
 
+// ─── Persisted state ────────────────────────────────────────────────
+
+const CONFIG_PATH = path.join(os.homedir(), ".config", "pi-voice.json");
+
+function loadConfig(): { enabled: boolean } {
+  try {
+    const data = fs.readFileSync(CONFIG_PATH, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return { enabled: true }; // default: enabled
+  }
+}
+
+function saveConfig(cfg: { enabled: boolean }): void {
+  try {
+    fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  } catch {}
+}
+
 // ─── State ───────────────────────────────────────────────────────────
 
 const state = {
+  enabled: loadConfig().enabled,
   recording: false,
   recorder: null as ReturnType<typeof spawn> | null,
   chunks: [] as Buffer[],
@@ -196,6 +217,7 @@ function installInputHandler(ctx: any) {
   state.ctx = ctx;
 
   state.unsubInput = ctx.ui.onTerminalInput((data: string) => {
+    if (!state.enabled) return; // voice disabled — pass through normally
     const isSpace = data.length > 0 && [...data].every(c => c === " ");
     if (!isSpace) return;
 
@@ -272,7 +294,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("voice", {
-    description: "Voice dictation: hold Space to record, or toggle manually",
+    description: "Toggle voice dictation on/off. When on, hold Space to record.",
     handler: async (args, ctx) => {
       if (ctx.hasUI && !state.unsubInput) installInputHandler(ctx);
       state.ctx = ctx;
@@ -281,20 +303,20 @@ export default function (pi: ExtensionAPI) {
       if (sub === "status") {
         const rec = getRecorder();
         state.serverAvailable ??= await checkWhisperLive(STT_URL);
-        ctx.ui.notify(`🎙 ${rec ? "recorder ✓" : "no recorder"} · ${state.serverAvailable ? "streaming ✓" : "CLI fallback"}`, "info");
+        ctx.ui.notify(`🎙 ${state.enabled ? "ON" : "OFF"} · ${rec ? "recorder ✓" : "no recorder"} · ${state.serverAvailable ? "streaming ✓" : "CLI fallback"}`, "info");
         return;
       }
 
-      if (state.recording) {
+      // Toggle voice on/off
+      state.enabled = !state.enabled;
+      saveConfig({ enabled: state.enabled });
+
+      if (!state.enabled && state.recording) {
         state.isHoldActive = false;
         await stopRecording();
-      } else {
-        const ok = await startRecording();
-        if (ok) {
-          ctx.ui.setStatus("voice", "🎙 Recording… /voice to stop");
-          ctx.ui.notify("🎙 Recording… /voice to stop", "info");
-        }
       }
+
+      ctx.ui.notify(state.enabled ? "🎙 Voice ON — hold Space to dictate" : "🎙 Voice OFF", "info");
     },
   });
 
