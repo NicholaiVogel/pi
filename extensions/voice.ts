@@ -1,23 +1,6 @@
 /**
- * Voice Dictation — Streaming STT for pi.
- *
- * Hold Space to record, release to transcribe and insert.
- * Uses WhisperLive (faster-whisper) over WebSocket for streaming STT.
- * Falls back to whisper CLI if the server is unavailable.
- *
- * WhisperLive v0.8 protocol:
- *   1. Send config: {"uid":"...", "language":"en", "task":"transcribe"}
- *   2. Server: {"uid":"...", "message":"SERVER_READY", "backend":"faster_whisper"}
- *   3. Stream raw PCM audio chunks
- *   4. Server: {"uid":"...", "segments": [{"text":"...", "start":0, "end":1.5}]}
- *   5. Close when done
- *
- * Hold-to-talk (same as Claude Code):
- *   Terminal auto-repeat sends space every 30-80ms when held.
- *   5+ rapid spaces within 120ms gaps = hold intent.
- *   First 2 spaces flow to input (single tap types normally).
- *   On activation, warmup spaces are stripped and recording starts.
- *   When auto-repeat stops (600ms gap), recording stops and text is inserted.
+ * Voice Dictation — debug build.
+ * Tests what onTerminalInput actually receives for space presses.
  */
 
 import { spawn, execSync } from "node:child_process";
@@ -29,21 +12,20 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const STT_URL = process.env.WHISPER_LIVE_URL || "ws://127.0.0.1:4190/asr";
 const SAMPLE_RATE = 16000;
+
+// Hold detection thresholds
 const RAPID_KEY_GAP_MS = 120;
 const HOLD_THRESHOLD = 5;
 const WARMUP_THRESHOLD = 2;
 const RELEASE_TIMEOUT_MS = 600;
-
-interface Segment { text: string; start: number; end: number; }
 
 interface VoiceState {
   recording: boolean;
   recorder: ReturnType<typeof spawn> | null;
   chunks: Buffer[];
   ws: WebSocket | null;
-  serverReady: boolean;
-  segments: Segment[];
-  lastSegmentText: string;
+  transcript: string;
+  interim: string;
   serverAvailable: boolean | null;
   rapidCount: number;
   charsInInput: number;
@@ -51,7 +33,6 @@ interface VoiceState {
   releaseTimer: ReturnType<typeof setTimeout> | null;
   isHoldActive: boolean;
   unsubInput: (() => void) | null;
-  ctx: any;
 }
 
 const state: VoiceState = {
@@ -59,9 +40,8 @@ const state: VoiceState = {
   recorder: null,
   chunks: [],
   ws: null,
-  serverReady: false,
-  segments: [],
-  lastSegmentText: "",
+  transcript: "",
+  interim: "",
   serverAvailable: null,
   rapidCount: 0,
   charsInInput: 0,
@@ -69,21 +49,22 @@ const state: VoiceState = {
   releaseTimer: null,
   isHoldActive: false,
   unsubInput: null,
-  ctx: null,
 };
 
-// ─── Recorder ────────────────────────────────────────────────────────
-
 function getRecorder() {
-  try { execSync("which arecord", { stdio: "pipe" }); return { command: "arecord", args: ["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"] }; } catch {}
-  try { execSync("which rec", { stdio: "pipe" }); return { command: "rec", args: ["-q", "-r", "16000", "-c", "1", "-b", "16", "-e", "signed-integer", "-t", "raw", "--buffer", "1024", "-"] }; } catch {}
+  try {
+    execSync("which arecord", { encoding: "utf-8", stdio: "pipe" });
+    return { command: "arecord", args: ["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"] };
+  } catch {}
+  try {
+    execSync("which rec", { encoding: "utf-8", stdio: "pipe" });
+    return { command: "rec", args: ["-q", "-r", "16000", "-c", "1", "-b", "16", "-e", "signed-integer", "-t", "raw", "--buffer", "1024", "-"] };
+  } catch {}
   return null;
 }
 
-// ─── Server check ────────────────────────────────────────────────────
-
-async function checkServer(): Promise<boolean> {
-  if (state.serverAvailable !== null) return state.serverAvailable;
+function checkServer(): Promise<boolean> {
+  if (state.serverAvailable !== null) return Promise.resolve(state.serverAvailable);
   return new Promise((resolve) => {
     try {
       const ws = new WebSocket(STT_URL);
@@ -94,90 +75,24 @@ async function checkServer(): Promise<boolean> {
   });
 }
 
-// ─── Collect full transcript from segments ───────────────────────────
-// WhisperLive sends segments incrementally. The last segment is often
-// partial (being updated as more audio arrives). We accumulate finalized
-// segments and track the latest (possibly incomplete) one separately.
-
-function getFullTranscript(): string {
-  const finalized = state.segments.slice(0, -1).map((s) => s.text.trim()).filter(Boolean).join(" ");
-  const latest = state.lastSegmentText.trim();
-  return [finalized, latest].filter(Boolean).join(" ");
-}
-
-// ─── Streaming STT via WhisperLive ───────────────────────────────────
-
-function startStreaming(): void {
-  state.segments = [];
-  state.lastSegmentText = "";
-  state.serverReady = false;
-
-  const uid = `pi-${Date.now()}`;
+function startStreaming(ctx: any): void {
+  state.transcript = "";
+  state.interim = "";
   const ws = new WebSocket(STT_URL);
   state.ws = ws;
-
-  ws.on("open", () => {
-    ws.send(JSON.stringify({
-      uid,
-      language: "en",
-      task: "transcribe",
-      use_vad: true,
-    }));
-  });
-
+  ws.on("open", () => { ws.send(JSON.stringify({ type: "config", data: { language: "en", task: "transcribe" } })); });
   ws.on("message", (raw: Buffer) => {
     try {
       const msg = JSON.parse(raw.toString());
-
-      // SERVER_READY
-      if (msg.message === "SERVER_READY") {
-        state.serverReady = true;
-        return;
-      }
-
-      // Segments update
-      if (msg.segments && Array.isArray(msg.segments)) {
-        const segs: Segment[] = msg.segments;
-        state.segments = segs;
-
-        // The last segment is the latest (may be incomplete/updated)
-        if (segs.length > 0) {
-          state.lastSegmentText = segs[segs.length - 1].text || "";
-        }
-
-        // Show live preview in status bar
-        const preview = getFullTranscript();
-        if (preview && state.ctx) {
-          state.ctx.ui.setStatus("voice", `🎙 ${preview.slice(-80)}`);
-        }
-      }
+      const text = (msg.data || "").trim();
+      if (!text) return;
+      if (msg.type === "transcript" || msg.type === "partial") { state.interim = text; ctx.ui.setStatus("voice", `🎙 ${text}`); }
+      if (msg.type === "final" || msg.type === "complete") { state.transcript += (state.transcript ? " " : "") + text; state.interim = ""; }
     } catch {}
   });
-
   ws.on("error", () => {});
   ws.on("close", () => { state.ws = null; });
 }
-
-function streamAudioChunk(chunk: Buffer): void {
-  if (state.ws?.readyState === WebSocket.OPEN && state.serverReady) {
-    state.ws.send(chunk);
-  }
-}
-
-function finalizeStreaming(): Promise<string> {
-  return new Promise((resolve) => {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-      resolve(getFullTranscript());
-      return;
-    }
-    const timer = setTimeout(() => { state.ws?.close(); resolve(getFullTranscript()); }, 3000);
-    state.ws!.on("close", () => { clearTimeout(timer); resolve(getFullTranscript()); });
-    // Just close — server will flush any remaining transcription
-    try { state.ws!.close(); } catch { clearTimeout(timer); resolve(getFullTranscript()); }
-  });
-}
-
-// ─── Fallback: whisper CLI ───────────────────────────────────────────
 
 function buildWav(raw: Buffer): Buffer {
   const h = Buffer.alloc(44);
@@ -188,9 +103,7 @@ function buildWav(raw: Buffer): Buffer {
   return Buffer.concat([h, raw]);
 }
 
-function transcribeCli(audio: Buffer): void {
-  const ctx = state.ctx;
-  if (!ctx) return;
+function transcribeCli(audio: Buffer, ctx: any): void {
   const tmp = path.join(os.tmpdir(), `pi-voice-${Date.now()}.wav`);
   const base = path.basename(tmp, ".wav");
   const dir = os.tmpdir();
@@ -211,77 +124,66 @@ function transcribeCli(audio: Buffer): void {
   w.on("error", (e) => { ctx.ui.setStatus("voice", undefined); ctx.ui.notify(`🎙 ${e.message}`, "error"); });
 }
 
-// ─── Core start/stop ─────────────────────────────────────────────────
-
-async function startRecording(): Promise<boolean> {
-  const ctx = state.ctx;
-  if (!ctx) return false;
+async function startRecording(ctx: any): Promise<boolean> {
   const rec = getRecorder();
   if (!rec) { ctx.ui.notify("🎙 No recorder", "error"); return false; }
-
   state.chunks = [];
-  const streaming = await checkServer();
-
-  if (streaming) {
-    startStreaming();
-  }
-
+  const stream = await checkServer();
+  if (stream) startStreaming(ctx);
   const proc = spawn(rec.command, rec.args, { stdio: ["ignore", "pipe", "ignore"] });
-  proc.stdout.on("data", (chunk: Buffer) => {
-    state.chunks.push(chunk);
-    if (streaming) streamAudioChunk(chunk);
-  });
-  proc.on("error", () => { state.recording = false; state.recorder = null; ctx.ui.setStatus("voice", undefined); });
+  proc.stdout.on("data", (c: Buffer) => { state.chunks.push(c); if (stream && state.ws?.readyState === WebSocket.OPEN) state.ws.send(c); });
+  proc.on("error", () => { state.recording = false; state.recorder = null; });
   proc.on("close", () => { state.recorder = null; });
-
   state.recorder = proc;
   state.recording = true;
   return true;
 }
 
-async function stopRecording(): Promise<void> {
-  const ctx = state.ctx;
-  if (!ctx) return;
-
+async function stopRecording(ctx: any): Promise<void> {
   state.recorder?.kill("SIGTERM");
   state.recorder = null;
   state.recording = false;
-
-  const streaming = state.serverAvailable && state.ws;
-
-  if (streaming) {
+  const stream = state.serverAvailable && state.ws;
+  if (stream) {
     ctx.ui.setStatus("voice", "🎙 Finalizing…");
-    const text = await finalizeStreaming();
+    const text = await new Promise<string>((resolve) => {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) { resolve(state.transcript || state.interim); return; }
+      const t = setTimeout(() => { state.ws?.close(); resolve(state.transcript || state.interim); }, 2000);
+      state.ws!.on("close", () => { clearTimeout(t); resolve(state.transcript || state.interim); });
+      try { state.ws!.send(JSON.stringify({ type: "end" })); } catch { clearTimeout(t); resolve(state.transcript || state.interim); }
+    });
     ctx.ui.setStatus("voice", undefined);
-
-    if (text && ctx.hasUI) {
-      ctx.ui.pasteToEditor(text + " ");
-    }
-    const preview = text?.length > 80 ? text.slice(0, 80) + "…" : text;
-    ctx.ui.notify(preview ? `🎙 "${preview}"` : "🎙 No speech detected.", preview ? "info" : "warning");
+    if (text && ctx.hasUI) ctx.ui.pasteToEditor(text + " ");
+    ctx.ui.notify(`🎙 "${(text || "nothing").slice(0, 80)}"`, text ? "info" : "warning");
   } else {
     const audio = Buffer.concat(state.chunks);
     state.chunks = [];
     if (audio.length < 3200) { ctx.ui.notify("🎙 Too short", "warning"); ctx.ui.setStatus("voice", undefined); return; }
-    transcribeCli(audio);
+    transcribeCli(audio, ctx);
   }
 }
 
-// ─── Terminal input hold detector ────────────────────────────────────
+// ─── Terminal input handler ──────────────────────────────────────────
+// Installed directly on pi — not inside session_start.
+// We need ctx with ui, so we capture it from the first command invocation
+// or from session_start.
+
+let cachedCtx: any = null;
 
 function installInputHandler(ctx: any) {
-  if (state.unsubInput) return;
+  if (state.unsubInput) return; // already installed
   if (!ctx?.ui?.onTerminalInput) return;
-  state.ctx = ctx;
+
+  cachedCtx = ctx;
 
   state.unsubInput = ctx.ui.onTerminalInput((data: string) => {
-    // Detect space: raw terminal data for space bar is " " (0x20)
-    // Auto-repeat may batch: "   " = multiple spaces in one event
-    const isSpace = data.length > 0 && [...data].every(c => c === " ");
+    // Debug: log what we receive for space-like input
+    const isSpace = data === " " || data === "\x20" || (data.length > 0 && data.trim() === "" && [...data].every(c => c === " "));
+
     if (!isSpace) return;
 
     const now = Date.now();
-    const count = data.length;
+    const count = data.length; // auto-repeat may batch: "   " = 3 spaces
     const gap = now - state.lastKeyTime;
     state.lastKeyTime = now;
 
@@ -291,7 +193,7 @@ function installInputHandler(ctx: any) {
       state.releaseTimer = setTimeout(() => {
         state.releaseTimer = null;
         state.isHoldActive = false;
-        stopRecording();
+        if (cachedCtx) stopRecording(cachedCtx);
       }, RELEASE_TIMEOUT_MS);
       return { consume: true };
     }
@@ -305,7 +207,7 @@ function installInputHandler(ctx: any) {
 
     state.rapidCount += count;
 
-    // Warmup phase — let through
+    // Still in warmup phase — let through
     if (state.rapidCount <= WARMUP_THRESHOLD) {
       state.charsInInput = state.rapidCount;
       return;
@@ -329,14 +231,15 @@ function installInputHandler(ctx: any) {
     state.rapidCount = 0;
     state.charsInInput = 0;
 
-    startRecording().then((ok) => {
+    startRecording(ctx).then((ok) => {
       if (ok) {
         ctx.ui.setStatus("voice", "🎙 Listening…");
+        ctx.ui.notify("🎙 Recording… release Space", "info");
         if (state.releaseTimer) clearTimeout(state.releaseTimer);
         state.releaseTimer = setTimeout(() => {
           state.releaseTimer = null;
           state.isHoldActive = false;
-          stopRecording();
+          stopRecording(ctx);
         }, RELEASE_TIMEOUT_MS);
       } else {
         state.isHoldActive = false;
@@ -345,22 +248,26 @@ function installInputHandler(ctx: any) {
 
     return { consume: true };
   });
+
+  ctx.ui.notify("🎙 Voice hold-space detector installed", "info");
 }
 
-// ─── Extension ───────────────────────────────────────────────────────
-
 export default function (pi: ExtensionAPI) {
+  // Install terminal input handler on session_start (has UI context)
   pi.on("session_start", (ctx: any) => {
     if (ctx.hasUI) installInputHandler(ctx);
   });
 
+  // Also try on context event as fallback
   pi.on("context", (ctx: any) => {
     if (ctx.hasUI && !state.unsubInput) installInputHandler(ctx);
   });
 
+  // /voice command
   pi.registerCommand("voice", {
     description: "Voice dictation: hold Space to record, or toggle manually",
     handler: async (args, ctx) => {
+      // Install handler if not yet done (belt-and-suspenders)
       if (ctx.hasUI && !state.unsubInput) installInputHandler(ctx);
 
       const sub = args?.trim();
@@ -371,13 +278,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      state.ctx = ctx;
-
       if (state.recording) {
         state.isHoldActive = false;
-        await stopRecording();
+        await stopRecording(ctx);
       } else {
-        const ok = await startRecording();
+        const ok = await startRecording(ctx);
         if (ok) {
           ctx.ui.setStatus("voice", "🎙 Recording… /voice to stop");
           ctx.ui.notify("🎙 Recording… /voice to stop", "info");
@@ -393,6 +298,8 @@ export default function (pi: ExtensionAPI) {
     state.unsubInput?.();
     state.recording = false;
     state.isHoldActive = false;
+    state.recorder = null;
+    state.ws = null;
     state.unsubInput = null;
   });
 }
