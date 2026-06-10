@@ -190,6 +190,9 @@ async function runReview(
   signal?: AbortSignal,
   onUpdate?: OnUpdateCallback,
   modelFlag?: string,
+  prompt?: string,
+  files?: string[],
+  hasDiff?: boolean,
 ): Promise<ReviewDetails> {
   const details: ReviewDetails = {
     mode,
@@ -210,9 +213,10 @@ async function runReview(
     });
   };
 
-  // Write the review prompt and diff to temp files
+  // Write the review prompt to a temp file
   const promptFile = await writeTempFile(REVIEW_PROMPT, "review-prompt");
-  const diffFile = await writeTempFile(diff, "review-diff");
+  const effectiveHasDiff = hasDiff ?? diff.trim().length > 0;
+  const diffFile = effectiveHasDiff ? await writeTempFile(diff, "review-diff") : null;
 
   try {
     const args = [
@@ -227,17 +231,57 @@ async function runReview(
 
     args.push("--append-system-prompt", promptFile.path);
 
-    // The task prompt includes the diff reference
-    const task = [
-      "Review the following diff. Read any files referenced in the diff for additional context.",
-      "",
-      `Diff stat:\n${stat}`,
-      "",
-      `The full diff is at ${diffFile.path}. Read it with the read tool.`,
-      "",
-      "After reviewing, provide your findings as structured JSON inside a ```json code block.",
-      "Follow the exact format from your system prompt.",
-    ].join("\n");
+    // Build the task prompt — diff-based or ad-hoc
+    let task: string;
+
+    if (effectiveHasDiff) {
+      task = [
+        "Review the following diff. Read any files referenced in the diff for full context.",
+        "",
+        `Diff stat:\n${stat}`,
+        "",
+        `The full diff is at ${diffFile!.path}. Read it with the read tool.`,
+        "",
+        "After reviewing, provide your findings as structured JSON inside a ```json code block.",
+        "Follow the exact format from your system prompt.",
+      ].join("\n");
+    } else {
+      // Ad-hoc review: no diff available, review from files/prompt directly
+      const parts = [
+        "No diff is available. Review the code directly by reading the files and directories specified below.",
+        "",
+      ];
+
+      if (files && files.length > 0) {
+        parts.push("Files to review:");
+        for (const f of files) {
+          parts.push(`- ${f}`);
+        }
+        parts.push("");
+        parts.push("Read each file completely. Check for bugs, logic errors, missing edge cases, and security issues.");
+      } else if (prompt) {
+        parts.push("Review scope:", "");
+        parts.push(prompt);
+        parts.push("");
+        parts.push("Use find, grep, ls, and read to inspect the relevant code in the working directory.");
+      } else {
+        parts.push("Inspect the current working directory for code to review.");
+        parts.push("Use ls, find, and read to discover and inspect source files.");
+      }
+
+      // Always include prompt as additional focus when files are specified
+      if (prompt && files && files.length > 0) {
+        parts.push("");
+        parts.push("Additional review focus:");
+        parts.push(prompt);
+      }
+
+      parts.push("");
+      parts.push("After reviewing, provide your findings as structured JSON inside a ```json code block.");
+      parts.push("Follow the exact format from your system prompt.");
+
+      task = parts.join("\n");
+    }
 
     args.push(task);
 
@@ -318,6 +362,7 @@ async function runReview(
   } finally {
     // Clean up temp files
     for (const f of [promptFile, diffFile]) {
+      if (!f) continue;
       try { fs.unlinkSync(f.path); } catch {}
       try { fs.rmdirSync(f.dir); } catch {}
     }
@@ -354,10 +399,13 @@ const ReviewParams = Type.Object({
     description: 'Commit ref for commit mode (default: HEAD).',
   })),
   prompt: Type.Optional(Type.String({
-    description: "Additional review instructions or focus areas.",
+    description: "Additional review instructions or focus areas. Also used as the primary review scope when no diff is available.",
   })),
   cwd: Type.Optional(Type.String({
     description: "Working directory to run the review in. Defaults to the session cwd.",
+  })),
+  files: Type.Optional(Type.Array(Type.String(), {
+    description: "Specific files or directories to review when no diff is available. The reviewer will read these directly.",
   })),
 });
 
@@ -380,20 +428,10 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const { diff, stat, resolvedMode, resolvedBase } = await gatherDiff(reviewCwd, mode, params.base, params.commit);
-
-        if (!diff.trim()) {
-          return {
-            content: [{ type: "text", text: "No changes to review." }],
-            details: {
-              mode: resolvedMode, base: resolvedBase, commit: params.commit,
-              diffStat: "", findings: [], summary: "No changes found.",
-              rawOutput: "", exitCode: 0, usage: { input: 0, output: 0, cost: 0 },
-            },
-          };
-        }
+        const hasDiff = diff.trim().length > 0;
 
         const extraPrompt = params.prompt ? `\n\nAdditional review focus:\n${params.prompt}` : "";
-        const fullDiff = diff + extraPrompt;
+        const fullDiff = hasDiff ? diff + extraPrompt : "";
 
         // Inherit the parent session's model
         const currentModel = ctx.getModel?.();
@@ -401,6 +439,7 @@ export default function (pi: ExtensionAPI) {
 
         const details = await runReview(
           reviewCwd, fullDiff, stat, resolvedMode, resolvedBase, params.commit, signal, onUpdate, modelFlag,
+          params.prompt, params.files, hasDiff,
         );
 
         const findingsCount = details.findings.length;
