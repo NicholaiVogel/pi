@@ -5,14 +5,22 @@ This is my repo of [pi](https://pi.dev/) extensions, which i use for (you guesse
 if you foolishly wish to copy these extensions for yourself, run 
 
 ```bash 
-git clone htts://github.com/NicholaiVogel/pi-extensions.git ~/.pi/agent/extensions 
+git clone https://github.com/NicholaiVogel/pi.git ~/.pi/agent 
 ```
 
 The files in here are of course the ones I've made myself, or rather, my agent made them, per my verbal harassment and belittling:
 
-- loop - `/loop` adds a claude code style loop command, for when you need loops, because you think you're a forward deployed loop engineer, and you have no friends or loved ones. 
-- autoreview - `/review` basically an integrated version of steipetes autoreview skill, which im too lazy to link, google it.   
-- web - adds web search thru searxng and lightpanda
+- **loop** - `/loop` adds a claude code style loop command, for when you need loops, because you think you're a forward deployed loop engineer, and you have no friends or loved ones.
+- **autoreview** - `/review` spawns an isolated child pi reviewer that inherits the active model, auto-detects what to review (local/branch/commit), and returns structured findings with severity, file, line, and suggested fixes.
+- **web** - adds web search thru searxng and lightpanda
+
+And then some I yoinked from [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup) because why write when you can steal:
+
+- **git-status-widget** - shows current git branch and unstaged file count in the status bar, auto-updates every 2s
+- **tps-tracker** - live tokens/sec counter during model generation, reports final TPS stats when the agent finishes
+- **diff** - `/diff` tracks files changed by the last agent run and lets you open them in your editor
+- **yeet** - `/yeet` adds, commits, and pushes in one shot. Ship it.
+- **copy-all** - `/copy-all` copies the full conversation thread to clipboard
 
 However, I am also using extensions that I installed from the third party extensions repository available on [pi.dev](https://pi.dev/packages) so do with that which you will. Here is a list: 
 
