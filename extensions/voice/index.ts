@@ -45,6 +45,9 @@ const state = {
   releaseTimer: null as ReturnType<typeof setTimeout> | null,
   isHoldActive: false,
   unsubInput: null as (() => void) | null,
+  // Live editor preview (Claude Code pattern: prefix + transcript + suffix)
+  voicePrefix: "",    // editor text before the cursor when recording starts
+  voiceSuffix: "",    // editor text after the cursor
 };
 
 // ─── Recorder ────────────────────────────────────────────────────────
@@ -101,17 +104,31 @@ async function startRecording(): Promise<boolean> {
   state.chunks = [];
   state.serverAvailable ??= await checkWhisperLive(STT_URL);
 
+  // Anchor the editor content (Claude Code pattern)
+  const editorText = ctx.ui.getEditorText?.() || "";
+  state.voicePrefix = editorText;
+  state.voiceSuffix = "";
+
   if (state.serverAvailable) {
     try {
-      const prompt = buildInitialPrompt({ editorText: ctx.ui.getEditorText?.() });
+      const prompt = buildInitialPrompt({ editorText: state.voicePrefix });
       const client = new WhisperLiveClient(
         STT_URL,
         { initialPrompt: prompt },
-        // Callback: update status bar on every segment update
+        // Callback: write live transcript into the editor
         (_text, _isFinal) => {
+          if (!ctx.hasUI) return;
           const preview = client.transcript;
-          if (preview && ctx.hasUI) {
-            ctx.ui.setStatus("voice", `🎙 ${preview.slice(-80)}`);
+          if (preview) {
+            const needsSpace = state.voicePrefix.length > 0 && !/\s$/.test(state.voicePrefix);
+            const needsTrailing = state.voiceSuffix.length > 0 && !/^\s/.test(state.voiceSuffix);
+            const live = state.voicePrefix
+              + (needsSpace ? " " : "")
+              + preview
+              + (needsTrailing ? " " : "")
+              + state.voiceSuffix;
+            ctx.ui.setEditorText(live);
+            ctx.ui.setStatus("voice", `🎙 ${preview.slice(-60)}`);
           }
         },
       );
@@ -153,9 +170,20 @@ async function stopRecording(): Promise<void> {
     const text = cleanTranscript(raw);
     ctx.ui.setStatus("voice", undefined);
 
-    if (text && ctx.hasUI) ctx.ui.pasteToEditor(text + " ");
+    if (text && ctx.hasUI) {
+      // Write the final clean version into the editor
+      const needsSpace = state.voicePrefix.length > 0 && !/\s$/.test(state.voicePrefix);
+      const finalText = state.voicePrefix
+        + (needsSpace ? " " : "")
+        + text
+        + " ";
+      ctx.ui.setEditorText(finalText);
+    }
     const preview = text?.length > 80 ? text.slice(0, 80) + "…" : text;
     ctx.ui.notify(preview ? `🎙 "${preview}"` : "🎙 No speech detected.", preview ? "info" : "warning");
+    // Reset voice anchor
+    state.voicePrefix = "";
+    state.voiceSuffix = "";
   } else {
     const audio = Buffer.concat(state.chunks);
     state.chunks = [];
