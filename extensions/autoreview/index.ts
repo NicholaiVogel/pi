@@ -534,11 +534,22 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Also register a /review command for user-facing entry
+  // This directly delegates to the agent to call the autoreview tool,
+  // passing any args (e.g., /review local, /review branch --base HEAD~3)
   pi.registerCommand("review", {
-    description: "Run structured code review — auto-detects whether to review local, branch, or commit changes",
-    handler: async (_args, _ctx) => {
-      // Simply trigger the tool — the agent will auto-detect the best mode
-      pi.sendUserMessage("Run a code review using the autoreview tool with auto mode.", { deliverAs: "followUp" });
+    description: "Run structured code review — auto-detects local/branch/commit changes. Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>",
+    handler: async (args, _ctx) => {
+      const argStr = (args || "").trim();
+      const modeMatch = argStr.match(/\b(auto|local|branch|commit)\b/);
+      const mode = modeMatch ? modeMatch[1] : "auto";
+      const baseMatch = argStr.match(/--base\s+(\S+)/);
+      const commitMatch = argStr.match(/--commit\s+(\S+)/);
+
+      let prompt = `Run a code review using the autoreview tool with mode "${mode}".`;
+      if (baseMatch) prompt += ` Use base "${baseMatch[1]}".`;
+      if (commitMatch) prompt += ` Review commit "${commitMatch[1]}".`;
+
+      pi.sendUserMessage(prompt, { deliverAs: "followUp" });
     },
   });
 }
