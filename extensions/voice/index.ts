@@ -104,7 +104,17 @@ async function startRecording(): Promise<boolean> {
   if (state.serverAvailable) {
     try {
       const prompt = buildInitialPrompt({ editorText: ctx.ui.getEditorText?.() });
-      const client = new WhisperLiveClient(STT_URL, { initialPrompt: prompt });
+      const client = new WhisperLiveClient(
+        STT_URL,
+        { initialPrompt: prompt },
+        // Callback: update status bar on every segment update
+        (_text, _isFinal) => {
+          const preview = client.transcript;
+          if (preview && ctx.hasUI) {
+            ctx.ui.setStatus("voice", `🎙 ${preview.slice(-80)}`);
+          }
+        },
+      );
       await client.connect();
       state.wsClient = client;
     } catch {

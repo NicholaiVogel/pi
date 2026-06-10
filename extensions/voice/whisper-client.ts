@@ -4,15 +4,14 @@
  * Protocol:
  *   1. Send config: {"uid":"...", "language":"en", "task":"transcribe", "initial_prompt":"..."}
  *   2. Server: {"uid":"...", "message":"SERVER_READY", "backend":"faster_whisper"}
- *   3. Stream raw PCM as float32 (16kHz mono) — server expects np.float32, NOT int16
+ *   3. Stream raw PCM as float32 (16kHz mono) — server expects np.float32
  *   4. Server: {"uid":"...", "segments": [{"text":"...", "start":0, "end":1.5}]}
  *   5. Close WS when done
  *
- * Usage:
- *   const client = new WhisperLiveClient("ws://localhost:4190/asr");
- *   await client.connect();
- *   client.sendAudio(pcmBuffer);
- *   const text = await client.finalize();
+ * Inspired by Claude Code's voice_stream + useVoice pattern:
+ *   - Callback-driven: onTranscript(text, isFinal) for each segment update
+ *   - Accumulates finalized text internally
+ *   - Tracks latest interim separately for live preview
  */
 
 import { WebSocket } from "ws";
@@ -21,16 +20,28 @@ export interface Segment {
   text: string;
   start: number;
   end: number;
+  completed?: boolean;
 }
+
+export type TranscriptCallback = (text: string, isFinal: boolean) => void;
 
 export class WhisperLiveClient {
   private ws: WebSocket | null = null;
-  private segments: Segment[] = [];
-  private lastSegmentText = "";
-  private ready = false;
   private uid: string;
+  private ready = false;
 
-  constructor(private url: string, private opts?: { initialPrompt?: string }) {
+  // Accumulated finalized text (like Claude Code's accumulatedRef)
+  private accumulated = "";
+  // Latest segment text (interim, may be updated)
+  private lastSegmentText = "";
+  // Track which segments we've already finalized
+  private lastCompletedCount = 0;
+
+  constructor(
+    private url: string,
+    private opts?: { initialPrompt?: string },
+    private onTranscript?: TranscriptCallback,
+  ) {
     this.uid = `pi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
@@ -42,16 +53,20 @@ export class WhisperLiveClient {
     return this.ready;
   }
 
-  /** Current full transcript (finalized segments + latest partial). */
+  /** Full transcript: all accumulated finals + latest interim. */
   get transcript(): string {
-    const finalized = this.segments.slice(0, -1).map(s => s.text.trim()).filter(Boolean).join(" ");
-    const latest = this.lastSegmentText.trim();
-    return [finalized, latest].filter(Boolean).join(" ");
+    const interim = this.lastSegmentText.trim();
+    return [this.accumulated, interim].filter(Boolean).join(" ");
   }
 
-  /** Latest partial text (for live preview). */
+  /** Just the latest interim text (for live preview). */
   get partial(): string {
     return this.lastSegmentText.trim();
+  }
+
+  /** Just the accumulated final text (no interim). */
+  get finalized(): string {
+    return this.accumulated.trim();
   }
 
   async connect(): Promise<void> {
@@ -68,7 +83,7 @@ export class WhisperLiveClient {
           uid: this.uid,
           language: "en",
           task: "transcribe",
-          use_vad: false,  // base model VAD is too aggressive, strips real speech
+          use_vad: false,
           initial_prompt: this.opts?.initialPrompt || undefined,
         }));
       });
@@ -85,10 +100,7 @@ export class WhisperLiveClient {
           }
 
           if (msg.segments && Array.isArray(msg.segments)) {
-            this.segments = msg.segments;
-            if (msg.segments.length > 0) {
-              this.lastSegmentText = msg.segments[msg.segments.length - 1].text || "";
-            }
+            this.handleSegments(msg.segments as Segment[]);
           }
         } catch {}
       });
@@ -105,38 +117,90 @@ export class WhisperLiveClient {
     });
   }
 
-  /** Convert int16 PCM to float32 and send. Server expects np.float32. */
+  /**
+   * Process segment updates from the server.
+   *
+   * WhisperLive sends the full segment list each time. The last segment
+   * is the current (possibly incomplete) one; earlier segments are finalized.
+   * When a segment has completed:true, it's done being updated.
+   *
+   * This mirrors Claude Code's onTranscript(text, isFinal) pattern:
+   *   - Newly finalized segments → onTranscript(text, true)
+   *   - Updated interim segment → onTranscript(text, false)
+   */
+  private handleSegments(segments: Segment[]): void {
+    if (segments.length === 0) return;
+
+    // Count completed segments — any new ones since last time are finals
+    const completedCount = segments.filter(s => s.completed).length;
+
+    // Emit finals for newly completed segments
+    if (completedCount > this.lastCompletedCount) {
+      for (let i = this.lastCompletedCount; i < completedCount; i++) {
+        const text = segments[i]?.text?.trim();
+        if (text) {
+          if (this.accumulated) this.accumulated += " ";
+          this.accumulated += text;
+          this.onTranscript?.(text, true);
+        }
+      }
+      this.lastCompletedCount = completedCount;
+    }
+
+    // Update the latest interim (last segment, regardless of completed status)
+    const latest = segments[segments.length - 1];
+    const interimText = latest?.text?.trim() || "";
+
+    // Only emit as interim if it changed
+    if (interimText !== this.lastSegmentText) {
+      this.lastSegmentText = interimText;
+      if (interimText) {
+        this.onTranscript?.(interimText, false);
+      }
+    }
+  }
+
+  /** Convert int16 PCM to float32 and send. */
   sendAudio(chunk: Buffer): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
-    // arecord gives us int16 LE. WhisperLive expects float32.
     const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) {
-      float32[i] = int16[i] / 32768;  // normalize to [-1.0, 1.0]
+      float32[i] = int16[i] / 32768;
     }
     this.ws.send(Buffer.from(float32.buffer));
   }
 
+  /**
+   * Close the connection and return the final transcript.
+   * Waits for the server to flush any remaining segments.
+   */
   async finalize(): Promise<string> {
-    const text = this.transcript;
+    // Promote any remaining interim to final
+    if (this.lastSegmentText.trim()) {
+      if (this.accumulated) this.accumulated += " ";
+      this.accumulated += this.lastSegmentText.trim();
+      this.lastSegmentText = "";
+    }
+
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return text;
+      return this.accumulated.trim();
     }
 
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.ws?.close();
-        resolve(this.transcript);
+        resolve(this.accumulated.trim());
       }, 3000);
 
       this.ws!.on("close", () => {
         clearTimeout(timer);
-        resolve(this.transcript);
+        resolve(this.accumulated.trim());
       });
 
       try { this.ws!.close(); } catch {
         clearTimeout(timer);
-        resolve(text);
+        resolve(this.accumulated.trim());
       }
     });
   }
