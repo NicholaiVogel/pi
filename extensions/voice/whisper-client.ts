@@ -4,7 +4,7 @@
  * Protocol:
  *   1. Send config: {"uid":"...", "language":"en", "task":"transcribe", "initial_prompt":"..."}
  *   2. Server: {"uid":"...", "message":"SERVER_READY", "backend":"faster_whisper"}
- *   3. Stream raw PCM (16kHz 16-bit mono) as binary WebSocket frames
+ *   3. Stream raw PCM as float32 (16kHz mono) — server expects np.float32, NOT int16
  *   4. Server: {"uid":"...", "segments": [{"text":"...", "start":0, "end":1.5}]}
  *   5. Close WS when done
  *
@@ -68,7 +68,7 @@ export class WhisperLiveClient {
           uid: this.uid,
           language: "en",
           task: "transcribe",
-          use_vad: true,
+          use_vad: false,  // base model VAD is too aggressive, strips real speech
           initial_prompt: this.opts?.initialPrompt || undefined,
         }));
       });
@@ -105,10 +105,16 @@ export class WhisperLiveClient {
     });
   }
 
+  /** Convert int16 PCM to float32 and send. Server expects np.float32. */
   sendAudio(chunk: Buffer): void {
-    if (this.ws?.readyState === WebSocket.OPEN && this.ready) {
-      this.ws.send(chunk);
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
+    // arecord gives us int16 LE. WhisperLive expects float32.
+    const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768;  // normalize to [-1.0, 1.0]
     }
+    this.ws.send(Buffer.from(float32.buffer));
   }
 
   async finalize(): Promise<string> {
