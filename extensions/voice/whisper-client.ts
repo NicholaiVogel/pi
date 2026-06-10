@@ -133,6 +133,15 @@ export class WhisperLiveClient {
 
     // Count completed segments — any new ones since last time are finals
     const completedCount = segments.filter(s => s.completed).length;
+    const latest = segments[segments.length - 1];
+
+    // If the last segment is completed, its text will be (or was already)
+    // added to `accumulated` by the finalization loop below. Clear interim
+    // BEFORE that loop runs so that any onTranscript callback inside the
+    // loop sees a consistent transcript (no stale interim tacked on).
+    if (latest?.completed) {
+      this.lastSegmentText = "";
+    }
 
     // Emit finals for newly completed segments
     if (completedCount > this.lastCompletedCount) {
@@ -147,15 +156,15 @@ export class WhisperLiveClient {
       this.lastCompletedCount = completedCount;
     }
 
-    // Update the latest interim (last segment, regardless of completed status)
-    const latest = segments[segments.length - 1];
-    const interimText = latest?.text?.trim() || "";
-
-    // Only emit as interim if it changed
-    if (interimText !== this.lastSegmentText) {
-      this.lastSegmentText = interimText;
-      if (interimText) {
-        this.onTranscript?.(interimText, false);
+    // Update the latest interim — only if the last segment is NOT completed.
+    // Completed segments were already added to `accumulated` above.
+    if (!latest?.completed) {
+      const interimText = latest?.text?.trim() || "";
+      if (interimText !== this.lastSegmentText) {
+        this.lastSegmentText = interimText;
+        if (interimText) {
+          this.onTranscript?.(interimText, false);
+        }
       }
     }
   }
