@@ -22,6 +22,14 @@ And then some I yoinked from [davis7dotsh/my-pi-setup](https://github.com/davis7
 - **yeet** - `/yeet` adds, commits, and pushes in one shot. Ship it.
 - **copy-all** - `/copy-all` copies the full conversation thread to clipboard
 
+### Themes
+
+32 themes in `~/.pi/agent/themes/` — select with `/settings`:
+
+Catppuccin (frappe, latte, macchiato, mocha) · Nord · Nord Deep · Dracula · Tokyo Dark · Solarized Osaka · Everforest · Everforest Deep · Gruvbox Light · OneDark Pro · OneDark Darker · OneDark Obsidian · Monokai Pro · Amber · Vesper · Miasma · Neapple · GitHub Dark Default · ANSI Dark · ANSI Light · E-Ink · E-Ink Dark · Green Screen 80s · Orange Tabby Cute · Noctis Lux
+
+Sources: [sting8k/pi-themes](https://github.com/sting8k/pi-themes), [otahontas/pi-coding-agent-catppuccin](https://github.com/otahontas/pi-coding-agent-catppuccin), [leblancfg/pi-ansi-themes](https://github.com/leblancfg/pi-ansi-themes), [bombman/pi-agent-themes](https://github.com/bombman/pi-agent-themes), [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup)
+
 However, I am also using extensions that I installed from the third party extensions repository available on [pi.dev](https://pi.dev/packages) so do with that which you will. Here is a list: 
 
 - pi-ask-user - `pi install npm:pi-ask-user` adds an interactive `ask_user` tool for collecting user decisions during an agent run.
