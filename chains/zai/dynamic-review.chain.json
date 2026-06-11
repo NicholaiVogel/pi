@@ -1,0 +1,84 @@
+{
+  "name": "zai-dynamic-review",
+  "description": "Discover review targets, fan out GLM reviewers, then synthesize findings.",
+  "chain": [
+    {
+      "agent": "scout",
+      "phase": "Discovery",
+      "label": "Find review targets",
+      "as": "targets",
+      "model": "zai/glm-5.1",
+      "outputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "reason", "angle"],
+              "properties": {
+                "path": { "type": "string" },
+                "reason": { "type": "string" },
+                "angle": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "task": "For this review task, inspect the repo/diff and return a structured JSON object via structured_output with up to 12 review targets. Each item must include path, reason, and angle. Task: {task}"
+    },
+    {
+      "expand": {
+        "from": { "output": "targets", "path": "/items" },
+        "item": "target",
+        "key": "/path",
+        "maxItems": 12,
+        "onEmpty": "fail"
+      },
+      "parallel": {
+        "agent": "reviewer",
+        "phase": "Review",
+        "label": "Review {target.path}",
+        "model": "zai/glm-5.1",
+        "outputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "findings", "confidence"],
+          "properties": {
+            "path": { "type": "string" },
+            "confidence": { "type": "string" },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["severity", "title", "evidence", "suggestedFix"],
+                "properties": {
+                  "severity": { "type": "string" },
+                  "title": { "type": "string" },
+                  "evidence": { "type": "string" },
+                  "suggestedFix": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "task": "Review {target.path} for this task: {task}\nReason: {target.reason}\nAngle: {target.angle}\nDo not modify project/source files. Return only evidence-backed findings through structured_output. If there are no findings, return an empty findings array."
+      },
+      "collect": { "as": "reviews" },
+      "concurrency": 6,
+      "phase": "Review fanout",
+      "label": "GLM reviewer fanout"
+    },
+    {
+      "agent": "context-builder",
+      "phase": "Synthesis",
+      "label": "Synthesize review",
+      "model": "zai/glm-5.1",
+      "task": "Synthesize review results from {outputs.reviews} for task: {task}. Group blockers, important fixes, optional suggestions, false positives, validation gaps, and recommended next steps. Be concise and cite target paths."
+    }
+  ]
+}

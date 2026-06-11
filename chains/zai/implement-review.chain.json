@@ -1,0 +1,84 @@
+{
+  "name": "zai-implement-review",
+  "description": "GLM worker implements, GLM reviewers validate, GLM worker applies accepted review fixes.",
+  "chain": [
+    {
+      "agent": "worker",
+      "phase": "Implementation",
+      "label": "Implement task",
+      "as": "implementation",
+      "model": "zai/glm-5.1",
+      "progress": true,
+      "acceptance": {
+        "criteria": [
+          "Requested change is implemented within the approved scope",
+          "Focused validation is run or a clear reason is reported if validation is impossible",
+          "Changed files, commands run, validation output, and residual risks are reported"
+        ],
+        "evidence": ["changed-files", "commands-run", "validation-output", "residual-risks", "diff-summary"],
+        "stopRules": [
+          "Do not expand product scope beyond the user task",
+          "Stop and report if a fix requires an unapproved architecture, product, or security decision"
+        ],
+        "maxFinalizationTurns": 3
+      },
+      "task": "Implement this task as the only writer against the active worktree unless worktree isolation was explicitly requested. Task: {task}"
+    },
+    {
+      "parallel": [
+        {
+          "agent": "reviewer",
+          "phase": "Validation",
+          "label": "Correctness review",
+          "as": "correctnessReview",
+          "model": "zai/glm-5.1",
+          "outputMode": "file-only",
+          "output": "validation/correctness.md",
+          "task": "Review the post-implementation diff for correctness and regression risks. Start from worker result: {outputs.implementation}\nTask: {task}\nDo not modify project/source files; returning findings via this output artifact is allowed."
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Validation",
+          "label": "Tests and validation review",
+          "as": "validationReview",
+          "model": "zai/glm-5.1",
+          "outputMode": "file-only",
+          "output": "validation/tests.md",
+          "task": "Review the post-implementation diff for missing tests, weak validation, and likely edge cases. Start from worker result: {outputs.implementation}\nTask: {task}\nDo not modify project/source files; returning findings via this output artifact is allowed."
+        },
+        {
+          "agent": "reviewer",
+          "phase": "Validation",
+          "label": "Maintainability review",
+          "as": "maintainabilityReview",
+          "model": "zai/glm-5.1",
+          "outputMode": "file-only",
+          "output": "validation/maintainability.md",
+          "task": "Review the post-implementation diff for simplicity, maintainability, and integration with repo conventions. Start from worker result: {outputs.implementation}\nTask: {task}\nDo not modify project/source files; returning findings via this output artifact is allowed."
+        }
+      ],
+      "concurrency": 3
+    },
+    {
+      "agent": "worker",
+      "phase": "Fixes",
+      "label": "Apply accepted review fixes",
+      "model": "zai/glm-5.1",
+      "progress": true,
+      "acceptance": {
+        "criteria": [
+          "Only review fixes worth doing now are applied",
+          "Focused validation is rerun or a clear reason is reported if validation is impossible",
+          "Final changed files, commands, validation output, and residual risks are reported"
+        ],
+        "evidence": ["changed-files", "commands-run", "validation-output", "residual-risks", "diff-summary"],
+        "stopRules": [
+          "Do not apply optional polish or scope expansion",
+          "Stop and report if reviewer feedback requires an unapproved decision"
+        ],
+        "maxFinalizationTurns": 3
+      },
+      "task": "Apply only concrete fixes worth doing now from these validation outputs. Ignore optional polish and false positives.\n\nCorrectness: {outputs.correctnessReview}\n\nValidation: {outputs.validationReview}\n\nMaintainability: {outputs.maintainabilityReview}\n\nOriginal task: {task}"
+    }
+  ]
+}
