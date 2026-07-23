@@ -1,9 +1,19 @@
 /**
  * Auto Review - Structured code review as a pi extension
  *
- * Spawns a child pi process with an isolated context window,
- * read-only tools, and a review-focused system prompt.
- * Returns structured findings back to the main agent.
+ * Spawns one or more child pi processes, each with an isolated context window,
+ * read+investigate tools (read, ls, find, grep, bash, web_search), and an
+ * adversarial review-focused system prompt. Returns structured findings back to
+ * the main agent.
+ *
+ * Design notes (see also prompt.ts):
+ *  - Findings are parsed defensively: case-insensitive fences, bare JSON,
+ *    {findings:[...]} wrappers, alternate field names, trailing commas. A
+ *    reviewer describing bugs in prose must not silently report "clean".
+ *  - A `status` field distinguishes "running" from "done" so the TUI never
+ *    paints a green "No actionable findings." while a review is still in flight.
+ *  - `reviewers` > 1 runs an ensemble of fresh-context reviewers in parallel and
+ *    unions their findings (deduped, max-severity wins).
  */
 
 import { spawn } from "node:child_process";
@@ -17,21 +27,26 @@ import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-a
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { REVIEW_PROMPT } from "./prompt.js";
+import { type Finding, type Severity, parseFindings, unionFindings, proseAfterJson } from "./findings.js";
 
 // -- Types --
 
-interface Finding {
-  severity: "critical" | "warning" | "info" | "suggestion";
-  file: string;
-  line?: number;
-  description: string;
-  suggested_fix?: string;
+interface ReviewerResult {
+  findings: Finding[];
+  rawOutput: string;
+  summary: string;
+  usage: { input: number; output: number; cost: number };
+  model?: string;
+  exitCode: number;
 }
 
 interface ReviewDetails {
   mode: string;
   base?: string;
   commit?: string;
+  reviewers: number;
+  /** "running" while any child reviewer is still active, "done" once all have exited. */
+  status: "running" | "done";
   diffStat: string;
   findings: Finding[];
   summary: string;
@@ -43,6 +58,8 @@ interface ReviewDetails {
 
 type OnUpdateCallback = (partial: AgentToolResult<ReviewDetails>) => void;
 
+const MAX_REVIEWERS = 8;
+
 // -- Helpers --
 
 function formatTokens(n: number): string {
@@ -51,30 +68,22 @@ function formatTokens(n: number): string {
   return `${(n / 1_000_000).toFixed(1)}M`;
 }
 
-function getFinalOutput(messages: Message[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "assistant") {
-      for (const part of messages[i].content) {
-        if (part.type === "text") return part.text;
-      }
-    }
+/** Concatenate every text part of an assistant message (a single turn). */
+function messageText(msg: Message): string {
+  if (msg.role !== "assistant") return "";
+  let out = "";
+  for (const part of msg.content as any[]) {
+    if (part.type === "text" && typeof part.text === "string") out += part.text;
   }
-  return "";
+  return out;
 }
 
-function parseFindings(text: string): Finding[] {
-  // Try to extract JSON block from the review output
-  const jsonMatch = text.match(/```json\n([\s\S]*?)```/);
-  if (!jsonMatch) return [];
-
-  try {
-    const parsed = JSON.parse(jsonMatch[1]);
-    if (Array.isArray(parsed)) return parsed as Finding[];
-    if (parsed.findings && Array.isArray(parsed.findings)) return parsed.findings;
-  } catch {
-    // Not valid JSON, return empty
-  }
-  return [];
+function addUsage(a: ReviewDetails["usage"], b: ReviewDetails["usage"]): ReviewDetails["usage"] {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cost: a.cost + b.cost,
+  };
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -178,198 +187,345 @@ async function gatherDiff(
   return { diff, stat, resolvedMode, resolvedBase };
 }
 
-// -- Core review runner --
+// -- Task prompt builder --
 
-async function runReview(
-  cwd: string,
-  diff: string,
-  stat: string,
-  mode: string,
-  base?: string,
-  commit?: string,
-  signal?: AbortSignal,
-  onUpdate?: OnUpdateCallback,
-  modelFlag?: string,
-  prompt?: string,
-  files?: string[],
-  hasDiff?: boolean,
-): Promise<ReviewDetails> {
-  const details: ReviewDetails = {
-    mode,
-    base,
-    commit,
-    diffStat: stat.trim(),
+function buildReviewerTask(opts: {
+  hasDiff: boolean;
+  stat: string;
+  diffFilePath: string | null;
+  prompt?: string;
+  files?: string[];
+  reviewerIndex: number;
+  reviewerCount: number;
+}): string {
+  const ensembleNote =
+    opts.reviewerCount > 1
+      ? `\n\nYou are reviewer ${opts.reviewerIndex + 1} of ${opts.reviewerCount} independent reviewers. Each of you reviews the same change in a fresh context. Do your own complete investigation — assume the others may miss things, and vary your focus so the union of all reviewers is thorough. Do not mention the other reviewers in your output.`
+      : "";
+
+  if (opts.hasDiff && opts.diffFilePath) {
+    return [
+      "Adversarially review the following diff. Read the full diff, then read the FULL files around every changed region — bugs live in surrounding context the diff hides.",
+      "",
+      `Diff stat:`,
+      opts.stat,
+      "",
+      `The full diff is at ${opts.diffFilePath}. Read it with the read tool.`,
+      "",
+      "Use bash (grep/rg, git log, git blame, finding callers) and web_search (dependency contracts, API semantics) to verify anything you suspect. Trace concrete inputs/paths. Only drop a suspicion after you have actively tried and failed to confirm it.",
+      "",
+      opts.prompt ? `Additional review focus:\n${opts.prompt}\n` : "",
+      "Report findings as a JSON array inside a ```json block, following the exact format from your system prompt. Then add a 2–4 sentence prose assessment of the highest-risk areas.",
+      ensembleNote,
+    ]
+      .filter((l) => l !== "")
+      .join("\n")
+      .trim();
+  }
+
+  // Ad-hoc review (no diff)
+  const parts = [
+    "No diff is available. Adversarially review the code directly by reading the files and directories specified below. Read full files; investigate with bash (grep/rg, git log/blame, callers) and web_search where useful.",
+    "",
+  ];
+
+  if (opts.files && opts.files.length > 0) {
+    parts.push("Files to review:");
+    for (const f of opts.files) parts.push(`- ${f}`);
+    parts.push("", "Read each file completely. Check for bugs, logic errors, missing edge cases, security issues, and contract misuse.");
+  } else if (opts.prompt) {
+    parts.push("Review scope:", "", opts.prompt, "", "Use find, grep, ls, and read to inspect the relevant code in the working directory.");
+  } else {
+    parts.push("Inspect the current working directory for code to review. Use ls, find, and read to discover and inspect source files.");
+  }
+
+  if (opts.prompt && opts.files && opts.files.length > 0) {
+    parts.push("", "Additional review focus:", opts.prompt);
+  }
+
+  parts.push("", "Report findings as a JSON array inside a ```json block, following the exact format from your system prompt. Then add a 2–4 sentence prose assessment of the highest-risk areas.");
+  if (ensembleNote.trim()) parts.push(ensembleNote);
+
+  return parts.join("\n").trim();
+}
+
+// -- Single reviewer runner --
+
+interface SingleReviewerOpts {
+  cwd: string;
+  task: string;
+  modelFlag?: string;
+  promptFilePath: string;
+  signal?: AbortSignal;
+  reviewerIndex: number;
+  reviewerCount: number;
+  onPartial?: (partial: ReviewerResult) => void;
+}
+
+async function runSingleReviewer(opts: SingleReviewerOpts): Promise<ReviewerResult> {
+  const result: ReviewerResult = {
     findings: [],
+    rawOutput: "",
     summary: "",
+    usage: { input: 0, output: 0, cost: 0 },
+    exitCode: 0,
+  };
+
+  const args = [
+    "--mode", "json", "-p", "--no-session",
+    // read-only investigation + verification tools. Unknown names are ignored by pi,
+    // so web_search is a no-op if the web extension isn't loaded in the child.
+    "--tools", "read,ls,find,grep,bash,web_search",
+  ];
+
+  if (opts.modelFlag) args.push("--model", opts.modelFlag);
+  args.push("--append-system-prompt", opts.promptFilePath);
+  args.push(opts.task);
+
+  const invocation = getPiInvocation(args);
+  let wasAborted = false;
+  let buffer = "";
+  // Accumulate text across ALL assistant turns so findings split across turns,
+  // or emitted before a final prose summary, are not lost.
+  let accumulatedText = "";
+
+  const emit = () => opts.onPartial?.({ ...result, findings: [...result.findings] });
+
+  result.exitCode = await new Promise<number>((resolve) => {
+    const proc = spawn(invocation.command, invocation.args, {
+      cwd: opts.cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const processLine = (line: string) => {
+      if (!line.trim()) return;
+      let event: any;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      if (event.type === "message_end" && event.message) {
+        const msg = event.message as Message;
+        if (msg.role === "assistant") {
+          const usage = (msg as any).usage;
+          if (usage) {
+            result.usage.input += usage.input || 0;
+            result.usage.output += usage.output || 0;
+            result.usage.cost += usage.cost?.total || usage.cost || 0;
+          }
+          if (!result.model && (msg as any).model) result.model = (msg as any).model;
+
+          // Accumulate this turn's text; re-parse the full accumulation (F5).
+          const turnText = messageText(msg);
+          if (turnText.trim()) {
+            accumulatedText += (accumulatedText ? "\n\n" : "") + turnText;
+          }
+
+          result.rawOutput = accumulatedText.trim();
+          result.findings = parseFindings(accumulatedText);
+
+          const label = opts.reviewerCount > 1 ? `reviewer ${opts.reviewerIndex + 1}/${opts.reviewerCount}` : "reviewer";
+          const turns = (accumulatedText.match(/\n\n/g)?.length ?? 0) + (accumulatedText ? 1 : 0);
+          result.summary =
+            result.findings.length > 0
+              ? `${label}: ${result.findings.length} finding${result.findings.length > 1 ? "s" : ""} so far…`
+              : `${label}: investigating… (${turns} turn${turns === 1 ? "" : "s"})`;
+          emit();
+        }
+      }
+    };
+
+    proc.stdout.on("data", (data: Buffer) => {
+      buffer += data.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    });
+
+    proc.stderr.on("data", () => {
+      // Ignore stderr noise from the child.
+    });
+
+    proc.on("close", (code) => {
+      if (buffer.trim()) processLine(buffer);
+      resolve(code ?? 0);
+    });
+
+    proc.on("error", () => resolve(1));
+
+    if (opts.signal) {
+      const kill = () => {
+        wasAborted = true;
+        proc.kill("SIGTERM");
+        setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
+      };
+      if (opts.signal.aborted) kill();
+      else opts.signal.addEventListener("abort", kill, { once: true });
+    }
+  });
+
+  if (wasAborted) throw new Error("Review was aborted");
+
+  // Final summary: prefer prose after the JSON block; else a generated line.
+  const prose = proseAfterJson(result.rawOutput);
+  result.summary = prose || (result.findings.length > 0
+    ? `${result.findings.length} finding${result.findings.length > 1 ? "s" : ""}.`
+    : "no actionable findings.");
+  // Re-parse once more in case the final turn only just completed.
+  result.findings = parseFindings(accumulatedText);
+
+  return result;
+}
+
+// -- Orchestrator (handles the ensemble) --
+
+interface ReviewRunOpts {
+  cwd: string;
+  diff: string;
+  stat: string;
+  mode: string;
+  base?: string;
+  commit?: string;
+  signal?: AbortSignal;
+  onUpdate?: OnUpdateCallback;
+  modelFlag?: string;
+  prompt?: string;
+  files?: string[];
+  hasDiff: boolean;
+  reviewers: number;
+}
+
+async function runReview(opts: ReviewRunOpts): Promise<ReviewDetails> {
+  const details: ReviewDetails = {
+    mode: opts.mode,
+    base: opts.base,
+    commit: opts.commit,
+    reviewers: opts.reviewers,
+    status: "running",
+    diffStat: opts.stat.trim(),
+    findings: [],
+    summary: opts.reviewers > 1
+      ? `panel of ${opts.reviewers} reviewers starting…`
+      : "reviewer starting…",
     rawOutput: "",
     exitCode: 0,
     usage: { input: 0, output: 0, cost: 0 },
   };
 
-  const emitUpdate = () => {
-    onUpdate?.({
-      content: [{ type: "text", text: details.summary || "(reviewer thinking...)" }],
-      details: { ...details },
+  const emitAggregated = () => {
+    opts.onUpdate?.({
+      content: [{ type: "text", text: details.summary || "(reviewer working…)" }],
+      details: { ...details, findings: [...details.findings] },
     });
   };
+  emitAggregated();
 
-  // Write the review prompt to a temp file
   const promptFile = await writeTempFile(REVIEW_PROMPT, "review-prompt");
-  const effectiveHasDiff = hasDiff ?? diff.trim().length > 0;
-  const diffFile = effectiveHasDiff ? await writeTempFile(diff, "review-diff") : null;
+  const diffFile = opts.hasDiff ? await writeTempFile(opts.diff, "review-diff") : null;
 
   try {
-    const args = [
-      "--mode", "json", "-p", "--no-session",
-      "--tools", "read,ls,find,grep",
-    ];
-
-    // Inherit the parent session's model
-    if (modelFlag) {
-      args.push("--model", modelFlag);
-    }
-
-    args.push("--append-system-prompt", promptFile.path);
-
-    // Build the task prompt — diff-based or ad-hoc
-    let task: string;
-
-    if (effectiveHasDiff) {
-      task = [
-        "Review the following diff. Read any files referenced in the diff for full context.",
-        "",
-        `Diff stat:\n${stat}`,
-        "",
-        `The full diff is at ${diffFile!.path}. Read it with the read tool.`,
-        "",
-        "After reviewing, provide your findings as structured JSON inside a ```json code block.",
-        "Follow the exact format from your system prompt.",
-      ].join("\n");
-    } else {
-      // Ad-hoc review: no diff available, review from files/prompt directly
-      const parts = [
-        "No diff is available. Review the code directly by reading the files and directories specified below.",
-        "",
-      ];
-
-      if (files && files.length > 0) {
-        parts.push("Files to review:");
-        for (const f of files) {
-          parts.push(`- ${f}`);
-        }
-        parts.push("");
-        parts.push("Read each file completely. Check for bugs, logic errors, missing edge cases, and security issues.");
-      } else if (prompt) {
-        parts.push("Review scope:", "");
-        parts.push(prompt);
-        parts.push("");
-        parts.push("Use find, grep, ls, and read to inspect the relevant code in the working directory.");
-      } else {
-        parts.push("Inspect the current working directory for code to review.");
-        parts.push("Use ls, find, and read to discover and inspect source files.");
-      }
-
-      // Always include prompt as additional focus when files are specified
-      if (prompt && files && files.length > 0) {
-        parts.push("");
-        parts.push("Additional review focus:");
-        parts.push(prompt);
-      }
-
-      parts.push("");
-      parts.push("After reviewing, provide your findings as structured JSON inside a ```json code block.");
-      parts.push("Follow the exact format from your system prompt.");
-
-      task = parts.join("\n");
-    }
-
-    args.push(task);
-
-    const invocation = getPiInvocation(args);
-    let wasAborted = false;
-    let buffer = "";
-
-    const exitCode = await new Promise<number>((resolve) => {
-      const proc = spawn(invocation.command, invocation.args, {
-        cwd,
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
+    const buildTask = (i: number) =>
+      buildReviewerTask({
+        hasDiff: opts.hasDiff,
+        stat: opts.stat,
+        diffFilePath: diffFile?.path ?? null,
+        prompt: opts.prompt,
+        files: opts.files,
+        reviewerIndex: i,
+        reviewerCount: opts.reviewers,
       });
 
-      const processLine = (line: string) => {
-        if (!line.trim()) return;
-        let event: any;
-        try {
-          event = JSON.parse(line);
-        } catch {
-          return;
-        }
+    // Per-reviewer completion state, declared before runOne so the onPartial
+    // closure can safely reference it.
+    let completedReviewers = 0;
+    const perReviewer: ReviewerResult[] = new Array(opts.reviewers);
 
-        if (event.type === "message_end" && event.message) {
-          const msg = event.message as Message;
-          if (msg.role === "assistant") {
-            const usage = msg.usage;
-            if (usage) {
-              details.usage.input += usage.input || 0;
-              details.usage.output += usage.output || 0;
-              details.usage.cost += usage.cost?.total || 0;
+    const runOne = (i: number) =>
+      runSingleReviewer({
+        cwd: opts.cwd,
+        task: buildTask(i),
+        modelFlag: opts.modelFlag,
+        promptFilePath: promptFile.path,
+        signal: opts.signal,
+        reviewerIndex: i,
+        reviewerCount: opts.reviewers,
+        onPartial: opts.reviewers > 1
+          ? (partial) => {
+              // Each partial is that reviewer's full accumulated findings so far;
+              // unionFindings dedups by key, so unioning incremental snapshots is safe.
+              details.findings = unionFindings(details.findings, partial.findings);
+              details.model = details.model || partial.model;
+              details.summary = `panel of ${opts.reviewers} running — ${details.findings.length} finding${details.findings.length === 1 ? "" : "s"} so far`;
+              emitAggregated();
             }
-            if (!details.model && msg.model) details.model = msg.model;
-
-            const text = getFinalOutput([msg]);
-            if (text) {
-              details.rawOutput = text;
-              details.findings = parseFindings(text);
-              details.summary = text.split("\n").slice(0, 5).join("\n");
-            }
-            emitUpdate();
-          }
-        }
-      };
-
-      proc.stdout.on("data", (data: Buffer) => {
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) processLine(line);
+          : (partial) => {
+              details.findings = partial.findings;
+              details.rawOutput = partial.rawOutput;
+              details.summary = partial.summary;
+              details.model = details.model || partial.model;
+              emitAggregated();
+            },
       });
 
-      proc.stderr.on("data", () => {
-        // Ignore stderr noise
-      });
+    const tasks = Array.from({ length: opts.reviewers }, (_unused, i) =>
+      runOne(i)
+        .then((res) => {
+          perReviewer[i] = res;
+          completedReviewers++;
+        })
+        .catch((err) => {
+          // One reviewer failing should not kill the whole panel.
+          perReviewer[i] = {
+            findings: [],
+            rawOutput: "",
+            summary: `reviewer ${i + 1} failed: ${err?.message || err}`,
+            usage: { input: 0, output: 0, cost: 0 },
+            exitCode: 1,
+          };
+          completedReviewers++;
+        }),
+    );
 
-      proc.on("close", (code) => {
-        if (buffer.trim()) processLine(buffer);
-        resolve(code ?? 0);
-      });
+    await Promise.all(tasks);
 
-      proc.on("error", () => resolve(1));
-
-      if (signal) {
-        const kill = () => {
-          wasAborted = true;
-          proc.kill("SIGTERM");
-          setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
-        };
-        if (signal.aborted) kill();
-        else signal.addEventListener("abort", kill, { once: true });
+    // Final aggregation: union the LAST snapshot from each reviewer, sum usage.
+    let unioned: Finding[] = [];
+    let combinedOutput = "";
+    let exitCode = 0;
+    for (const res of perReviewer) {
+      if (!res) continue;
+      unioned = unionFindings(unioned, res.findings);
+      details.usage = addUsage(details.usage, res.usage);
+      if (res.model && !details.model) details.model = res.model;
+      if (res.exitCode !== 0) exitCode = res.exitCode;
+      if (res.rawOutput) {
+        combinedOutput += (combinedOutput ? "\n\n--- reviewer ---\n\n" : "") + res.rawOutput;
       }
-    });
-
+    }
+    details.findings = unioned;
+    details.rawOutput = opts.reviewers > 1 ? combinedOutput : (perReviewer[0]?.rawOutput ?? "");
     details.exitCode = exitCode;
-    if (wasAborted) throw new Error("Review was aborted");
-    return details;
   } finally {
-    // Clean up temp files
     for (const f of [promptFile, diffFile]) {
       if (!f) continue;
       try { fs.unlinkSync(f.path); } catch {}
       try { fs.rmdirSync(f.dir); } catch {}
     }
   }
+
+  details.status = "done";
+  const n = details.findings.length;
+  details.summary = n > 0
+    ? `Review complete (${opts.mode})${opts.reviewers > 1 ? ` ×${opts.reviewers}` : ""}: ${n} finding${n > 1 ? "s" : ""}.`
+    : `Review complete (${opts.mode})${opts.reviewers > 1 ? ` ×${opts.reviewers}` : ""}: no actionable findings.`;
+
+  return details;
 }
 
-// -- Severity helpers --
+// -- Severity helpers (rendering) --
 
 function severityIcon(s: string, fg: (c: string, t: string) => string) {
   switch (s) {
@@ -379,10 +535,6 @@ function severityIcon(s: string, fg: (c: string, t: string) => string) {
     case "suggestion": return fg("muted", "○");
     default: return fg("muted", "·");
   }
-}
-
-function severityLabel(s: string) {
-  return s.toUpperCase().padEnd(11);
 }
 
 // -- Tool definition --
@@ -407,24 +559,32 @@ const ReviewParams = Type.Object({
   files: Type.Optional(Type.Array(Type.String(), {
     description: "Specific files or directories to review when no diff is available. The reviewer will read these directly.",
   })),
+  reviewers: Type.Optional(Type.Integer({
+    description: "Number of independent fresh-context reviewers to run in parallel (ensemble). Findings are unioned and deduped; max severity wins on collisions. Default 1. Use 3+ for adversarial coverage that catches what a single pass misses.",
+    minimum: 1,
+    maximum: MAX_REVIEWERS,
+  })),
 });
 
 export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "autoreview",
     label: "Auto Review",
-    description: "Run structured code review using an isolated reviewer. Returns findings with severity, file, line, and suggested fixes. Pass cwd to review a different repo.",
-    promptSnippet: "Run structured code review on changes and return actionable findings",
+    description: "Run structured, adversarial code review using isolated reviewer(s) with read+investigate tools (read, ls, find, grep, bash, web_search). Returns findings with severity, file, line, and suggested fixes. Pass reviewers=3+ for an ensemble that unions findings from multiple fresh-context reviewers. Pass cwd to review a different repo.",
+    promptSnippet: "Run adversarial structured code review on changes and return actionable findings",
     promptGuidelines: [
-      "Use autoreview after non-trivial code edits, before committing, or when the user asks for a review.",
+      "Use autoreview after non-trivial code edits, before committing, or when the user asks for a review. It spawns isolated reviewer(s) with their own context window — they cannot see your conversation.",
+      "For high-risk or large changes, pass reviewers=3 (or more, up to 8) so multiple fresh-context reviewers run in parallel and their findings are unioned. A single pass under-reports; the ensemble is what closes the gap.",
       "After fixing findings from autoreview, run it again to verify the fix and catch regressions.",
-      "autoreview spawns a separate reviewer with its own context window — it cannot see your conversation.",
     ],
     parameters: ReviewParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const mode = params.mode ?? "auto";
       const reviewCwd = params.cwd || ctx.cwd;
+
+      const reviewersRaw = params.reviewers != null ? Number(params.reviewers) : 1;
+      const reviewers = Number.isFinite(reviewersRaw) ? Math.max(1, Math.min(MAX_REVIEWERS, Math.floor(reviewersRaw))) : 1;
 
       try {
         const { diff, stat, resolvedMode, resolvedBase } = await gatherDiff(reviewCwd, mode, params.base, params.commit);
@@ -433,22 +593,28 @@ export default function (pi: ExtensionAPI) {
         const extraPrompt = params.prompt ? `\n\nAdditional review focus:\n${params.prompt}` : "";
         const fullDiff = hasDiff ? diff + extraPrompt : "";
 
-        // Inherit the parent session's model
+        // Inherit the parent session's model.
         const currentModel = ctx.getModel?.();
         const modelFlag = currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined;
 
-        const details = await runReview(
-          reviewCwd, fullDiff, stat, resolvedMode, resolvedBase, params.commit, signal, onUpdate, modelFlag,
-          params.prompt, params.files, hasDiff,
-        );
-
-        const findingsCount = details.findings.length;
-        const summary = findingsCount > 0
-          ? `Review complete (${resolvedMode}): ${findingsCount} finding${findingsCount > 1 ? "s" : ""}.`
-          : `Review complete (${resolvedMode}): no actionable findings.`;
+        const details = await runReview({
+          cwd: reviewCwd,
+          diff: fullDiff,
+          stat,
+          mode: resolvedMode,
+          base: resolvedBase,
+          commit: params.commit,
+          signal,
+          onUpdate,
+          modelFlag,
+          prompt: params.prompt,
+          files: params.files,
+          hasDiff,
+          reviewers,
+        });
 
         return {
-          content: [{ type: "text", text: details.rawOutput || summary }],
+          content: [{ type: "text", text: details.rawOutput || details.summary }],
           details,
         };
       } catch (err: any) {
@@ -456,7 +622,7 @@ export default function (pi: ExtensionAPI) {
           content: [{ type: "text", text: `Review failed: ${err.message}` }],
           details: {
             mode: mode === "auto" ? "auto" : mode, base: params.base, commit: params.commit,
-            diffStat: "", findings: [], summary: `Error: ${err.message}`,
+            reviewers, status: "done", diffStat: "", findings: [], summary: `Error: ${err.message}`,
             rawOutput: "", exitCode: 1, usage: { input: 0, output: 0, cost: 0 },
           },
           isError: true,
@@ -467,6 +633,7 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       const mode = args.mode ?? "auto";
       let text = theme.fg("toolTitle", theme.bold("autoreview ")) + theme.fg("accent", mode);
+      if (args.reviewers && args.reviewers > 1) text += theme.fg("accent", ` ×${args.reviewers}`);
       if (args.cwd) text += theme.fg("muted", ` --cwd ${args.cwd}`);
       if (args.base) text += theme.fg("muted", ` --base ${args.base}`);
       if (args.commit) text += theme.fg("muted", ` --commit ${args.commit}`);
@@ -482,11 +649,15 @@ export default function (pi: ExtensionAPI) {
 
       const mdTheme = getMarkdownTheme();
       const hasFindings = details.findings.length > 0;
-      const icon = result.isError
-        ? theme.fg("error", "✗")
-        : hasFindings
-          ? theme.fg("warning", "▲")
-          : theme.fg("success", "✓");
+      const isRunning = details.status === "running";
+
+      const icon = isRunning
+        ? theme.fg("accent", "◐")
+        : result.isError
+          ? theme.fg("error", "✗")
+          : hasFindings
+            ? theme.fg("warning", "▲")
+            : theme.fg("success", "✓");
 
       if (expanded) {
         const container = new Container();
@@ -494,6 +665,8 @@ export default function (pi: ExtensionAPI) {
         // Header
         let header = `${icon} ${theme.fg("toolTitle", theme.bold("review"))}`;
         header += theme.fg("muted", ` (${details.mode})`);
+        if (details.reviewers > 1) header += theme.fg("accent", ` ×${details.reviewers}`);
+        if (isRunning) header += theme.fg("accent", " · in progress");
         if (details.diffStat) {
           const statLine = details.diffStat.split("\n").pop() || "";
           header += theme.fg("dim", ` ${statLine.trim()}`);
@@ -515,6 +688,9 @@ export default function (pi: ExtensionAPI) {
               container.addChild(new Text(theme.fg("dim", `   → ${f.suggested_fix}`), 0, 0));
             }
           }
+        } else if (isRunning) {
+          container.addChild(new Spacer(1));
+          container.addChild(new Text(theme.fg("accent", "Reviewers are still running — no findings yet."), 0, 0));
         }
 
         // Full output as markdown
@@ -541,6 +717,7 @@ export default function (pi: ExtensionAPI) {
       // Collapsed view
       let text = `${icon} ${theme.fg("toolTitle", theme.bold("review"))}`;
       text += theme.fg("muted", ` (${details.mode})`);
+      if (details.reviewers > 1) text += theme.fg("accent", ` ×${details.reviewers}`);
 
       if (hasFindings) {
         const bySev: Record<string, number> = {};
@@ -563,6 +740,8 @@ export default function (pi: ExtensionAPI) {
         if (details.findings.length > 5) {
           text += `\n${theme.fg("muted", `  ... +${details.findings.length - 5} more`)}`;
         }
+      } else if (isRunning) {
+        text += `\n${theme.fg("accent", "Review in progress…")}`;
       } else {
         text += `\n${theme.fg("success", "No actionable findings.")}`;
       }
@@ -572,21 +751,27 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Also register a /review command for user-facing entry
-  // This directly delegates to the agent to call the autoreview tool,
-  // passing any args (e.g., /review local, /review branch --base HEAD~3)
+  // /review command — delegates to the agent to call the autoreview tool.
+  // Supports: mode (auto|local|branch|commit), --base <ref>, --commit <ref>,
+  // --reviewers <n>, and --panel (shorthand for --reviewers 3).
   pi.registerCommand("review", {
-    description: "Run structured code review — auto-detects local/branch/commit changes. Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>",
+    description: "Run structured code review — auto-detects local/branch/commit changes. Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>, --reviewers <n>, --panel (=3 reviewers)",
     handler: async (args, _ctx) => {
       const argStr = (args || "").trim();
       const modeMatch = argStr.match(/\b(auto|local|branch|commit)\b/);
       const mode = modeMatch ? modeMatch[1] : "auto";
       const baseMatch = argStr.match(/--base\s+(\S+)/);
       const commitMatch = argStr.match(/--commit\s+(\S+)/);
+      const reviewersMatch = argStr.match(/--reviewers\s+(\d+)/);
+
+      let reviewers = 1;
+      if (/\b--panel\b/.test(argStr)) reviewers = 3;
+      else if (reviewersMatch) reviewers = Math.max(1, Math.min(MAX_REVIEWERS, parseInt(reviewersMatch[1], 10) || 1));
 
       let prompt = `Run a code review using the autoreview tool with mode "${mode}".`;
       if (baseMatch) prompt += ` Use base "${baseMatch[1]}".`;
       if (commitMatch) prompt += ` Review commit "${commitMatch[1]}".`;
+      if (reviewers > 1) prompt += ` Use reviewers=${reviewers} (ensemble).`;
 
       pi.sendUserMessage(prompt, { deliverAs: "followUp" });
     },
