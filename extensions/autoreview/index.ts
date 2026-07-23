@@ -1,10 +1,11 @@
 /**
  * Auto Review - Structured code review as a pi extension
  *
- * Spawns one or more child pi processes, each with an isolated context window,
- * read+investigate tools (read, ls, find, grep, bash, web_search), and an
- * adversarial review-focused system prompt. Returns structured findings back to
- * the main agent.
+ * Defaults to a single thorough reviewer: a child pi process with an isolated
+ * context window, read+investigate tools (read, ls, find, grep, bash, web_search),
+ * and an adversarial review-focused system prompt. Cheap to run and sufficient
+ * for ~90% of work. `reviewers` may be raised to 3 for an explicit deep-review
+ * ensemble (costs ~3x usage) — never auto-escalated; only on explicit request.
  *
  * Design notes (see also prompt.ts):
  *  - Findings are parsed defensively: case-insensitive fences, bare JSON,
@@ -13,7 +14,7 @@
  *  - A `status` field distinguishes "running" from "done" so the TUI never
  *    paints a green "No actionable findings." while a review is still in flight.
  *  - `reviewers` > 1 runs an ensemble of fresh-context reviewers in parallel and
- *    unions their findings (deduped, max-severity wins).
+ *    unions their findings (deduped, max-severity wins). Capped at 3.
  */
 
 import { spawn } from "node:child_process";
@@ -58,7 +59,7 @@ interface ReviewDetails {
 
 type OnUpdateCallback = (partial: AgentToolResult<ReviewDetails>) => void;
 
-const MAX_REVIEWERS = 8;
+const MAX_REVIEWERS = 3;
 
 // -- Helpers --
 
@@ -560,7 +561,7 @@ const ReviewParams = Type.Object({
     description: "Specific files or directories to review when no diff is available. The reviewer will read these directly.",
   })),
   reviewers: Type.Optional(Type.Integer({
-    description: "Number of independent fresh-context reviewers to run in parallel (ensemble). Findings are unioned and deduped; max severity wins on collisions. Default 1. Use 3+ for adversarial coverage that catches what a single pass misses.",
+    description: "Number of independent fresh-context reviewers to run in parallel (ensemble). Default 1, which is sufficient for ~90% of work and is cheap to run. Use 3 ONLY for deep review of high-risk changes (it costs ~3x usage). Findings are unioned and deduped; max severity wins on collisions. Do NOT escalate above 1 unless the user explicitly asks for deep/thorough review.",
     minimum: 1,
     maximum: MAX_REVIEWERS,
   })),
@@ -570,12 +571,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "autoreview",
     label: "Auto Review",
-    description: "Run structured, adversarial code review using isolated reviewer(s) with read+investigate tools (read, ls, find, grep, bash, web_search). Returns findings with severity, file, line, and suggested fixes. Pass reviewers=3+ for an ensemble that unions findings from multiple fresh-context reviewers. Pass cwd to review a different repo.",
+    description: "Run structured, adversarial code review using an isolated reviewer with read+investigate tools (read, ls, find, grep, bash, web_search). Returns findings with severity, file, line, and suggested fixes. Defaults to a single thorough pass — cheap and sufficient for almost all work. Pass reviewers=3 ONLY when the user explicitly asks for a deep/thorough review of high-risk changes. Pass cwd to review a different repo.",
     promptSnippet: "Run adversarial structured code review on changes and return actionable findings",
     promptGuidelines: [
-      "Use autoreview after non-trivial code edits, before committing, or when the user asks for a review. It spawns isolated reviewer(s) with their own context window — they cannot see your conversation.",
-      "For high-risk or large changes, pass reviewers=3 (or more, up to 8) so multiple fresh-context reviewers run in parallel and their findings are unioned. A single pass under-reports; the ensemble is what closes the gap.",
-      "After fixing findings from autoreview, run it again to verify the fix and catch regressions.",
+      "Use autoreview after non-trivial code edits, before committing, or when the user asks for a review. It spawns an isolated reviewer with its own context window — it cannot see your conversation.",
+      "IMPORTANT: Default to a single reviewer (reviewers=1). One thorough pass is enough for ~90% of work and keeps usage low. Do NOT raise reviewers on your own initiative based on change size or perceived risk — only use reviewers=3 when the user explicitly asks for a deep / thorough / extra-careful review, since it costs ~3x usage.",
+      "After fixing findings from autoreview, run it again (still reviewers=1) to verify the fix and catch regressions.",
     ],
     parameters: ReviewParams,
 
@@ -752,10 +753,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   // /review command — delegates to the agent to call the autoreview tool.
-  // Supports: mode (auto|local|branch|commit), --base <ref>, --commit <ref>,
-  // --reviewers <n>, and --panel (shorthand for --reviewers 3).
+  // Default: single reviewer (cheap). Supports: mode, --base <ref>, --commit <ref>,
+  // --reviewers <n> (max 3), and --deep/--thorough (alias for --reviewers 3).
   pi.registerCommand("review", {
-    description: "Run structured code review — auto-detects local/branch/commit changes. Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>, --reviewers <n>, --panel (=3 reviewers)",
+    description: "Run structured code review — auto-detects local/branch/commit changes. Default is a single thorough reviewer (cheap). Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>, --reviewers <n> (max 3), --deep (alias for --reviewers 3, for high-risk changes; costs ~3x usage)",
     handler: async (args, _ctx) => {
       const argStr = (args || "").trim();
       const modeMatch = argStr.match(/\b(auto|local|branch|commit)\b/);
@@ -765,13 +766,13 @@ export default function (pi: ExtensionAPI) {
       const reviewersMatch = argStr.match(/--reviewers\s+(\d+)/);
 
       let reviewers = 1;
-      if (/\b--panel\b/.test(argStr)) reviewers = 3;
+      if (/\b--deep\b|\b--panel\b|\b--thorough\b/.test(argStr)) reviewers = 3;
       else if (reviewersMatch) reviewers = Math.max(1, Math.min(MAX_REVIEWERS, parseInt(reviewersMatch[1], 10) || 1));
 
       let prompt = `Run a code review using the autoreview tool with mode "${mode}".`;
       if (baseMatch) prompt += ` Use base "${baseMatch[1]}".`;
       if (commitMatch) prompt += ` Review commit "${commitMatch[1]}".`;
-      if (reviewers > 1) prompt += ` Use reviewers=${reviewers} (ensemble).`;
+      if (reviewers > 1) prompt += ` Use reviewers=${reviewers} (user explicitly requested deep review).`;
 
       pi.sendUserMessage(prompt, { deliverAs: "followUp" });
     },
