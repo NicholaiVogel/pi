@@ -5,10 +5,10 @@ type ToggleEntry = {
   timestamp?: string;
 };
 
-const MAIN_PROVIDER = "openai-codex";
-const MAIN_MODEL = "gpt-5.5";
+const MAIN_PROVIDER = "zai";
+const MAIN_MODEL = "glm-5.2";
 const MAIN_FULL_MODEL = `${MAIN_PROVIDER}/${MAIN_MODEL}`;
-const CHILD_MODEL = "zai/glm-5.1";
+const CHILD_MODEL = "zai/glm-5.2";
 const STATE_TYPE = "zai-workflows-state";
 
 function isEnabledFromSession(ctx: ExtensionContext): boolean {

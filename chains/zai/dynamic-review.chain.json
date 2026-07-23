@@ -7,7 +7,7 @@
       "phase": "Discovery",
       "label": "Find review targets",
       "as": "targets",
-      "model": "zai/glm-5.1",
+      "model": "zai/glm-5.2",
       "outputSchema": {
         "type": "object",
         "additionalProperties": false,
@@ -42,7 +42,7 @@
         "agent": "reviewer",
         "phase": "Review",
         "label": "Review {target.path}",
-        "model": "zai/glm-5.1",
+        "model": "zai/glm-5.2",
         "outputSchema": {
           "type": "object",
           "additionalProperties": false,
@@ -77,7 +77,7 @@
       "agent": "context-builder",
       "phase": "Synthesis",
       "label": "Synthesize review",
-      "model": "zai/glm-5.1",
+      "model": "zai/glm-5.2",
       "task": "Synthesize review results from {outputs.reviews} for task: {task}. Group blockers, important fixes, optional suggestions, false positives, validation gaps, and recommended next steps. Be concise and cite target paths."
     }
   ]

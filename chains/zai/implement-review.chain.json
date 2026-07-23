@@ -7,7 +7,7 @@
       "phase": "Implementation",
       "label": "Implement task",
       "as": "implementation",
-      "model": "zai/glm-5.1",
+      "model": "zai/glm-5.2",
       "progress": true,
       "acceptance": {
         "criteria": [
@@ -31,7 +31,7 @@
           "phase": "Validation",
           "label": "Correctness review",
           "as": "correctnessReview",
-          "model": "zai/glm-5.1",
+          "model": "zai/glm-5.2",
           "outputMode": "file-only",
           "output": "validation/correctness.md",
           "task": "Review the post-implementation diff for correctness and regression risks. Start from worker result: {outputs.implementation}\nTask: {task}\nDo not modify project/source files; returning findings via this output artifact is allowed."
@@ -41,7 +41,7 @@
           "phase": "Validation",
           "label": "Tests and validation review",
           "as": "validationReview",
-          "model": "zai/glm-5.1",
+          "model": "zai/glm-5.2",
           "outputMode": "file-only",
           "output": "validation/tests.md",
           "task": "Review the post-implementation diff for missing tests, weak validation, and likely edge cases. Start from worker result: {outputs.implementation}\nTask: {task}\nDo not modify project/source files; returning findings via this output artifact is allowed."
@@ -51,7 +51,7 @@
           "phase": "Validation",
           "label": "Maintainability review",
           "as": "maintainabilityReview",
-          "model": "zai/glm-5.1",
+          "model": "zai/glm-5.2",
           "outputMode": "file-only",
           "output": "validation/maintainability.md",
           "task": "Review the post-implementation diff for simplicity, maintainability, and integration with repo conventions. Start from worker result: {outputs.implementation}\nTask: {task}\nDo not modify project/source files; returning findings via this output artifact is allowed."
@@ -63,7 +63,7 @@
       "agent": "worker",
       "phase": "Fixes",
       "label": "Apply accepted review fixes",
-      "model": "zai/glm-5.1",
+      "model": "zai/glm-5.2",
       "progress": true,
       "acceptance": {
         "criteria": [
