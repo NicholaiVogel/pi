@@ -2,6 +2,7 @@ node_modules
 **/node_modules/
 sessions
 auth.json
+auth.json.bak
 trust.json
 run-history.jsonl
 models.json
