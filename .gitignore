@@ -13,3 +13,12 @@ skills/
 npm/
 models.json.bak.20260615164747
 extensions/signet-pi.js
+tmp/
+REALTIME-SYSTEM-PROMPT.md
+cache
+chains
+agents
+missions
+pi-crash.log
+pi-codex-conversion.json
+models-store.json

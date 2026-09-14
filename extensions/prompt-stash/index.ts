@@ -110,10 +110,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ---------------------------------------------------------------------------
-	// Shortcut: Ctrl+S to stash
+	// Shortcut: Ctrl+Shift+S to stash
 	// ---------------------------------------------------------------------------
 
-	pi.registerShortcut("ctrl+s", {
+	pi.registerShortcut("ctrl+shift+s", {
 		description: "Stash current prompt draft",
 		handler: async (ctx: any) => {
 			if (!ctx.hasUI) return;
@@ -184,7 +184,7 @@ export default function (pi: ExtensionAPI) {
 				case "list":
 				default: {
 					if (stash.length === 0) {
-						ctx.ui.notify("No stashed prompts. Ctrl+S to stash one.", "info");
+						ctx.ui.notify("No stashed prompts. Ctrl+Shift+S to stash one.", "info");
 						return;
 					}
 					const lines: string[] = [];

@@ -40,6 +40,6 @@ However, I am also using extensions that I installed from the third party extens
 
 - pi-ask-user - `pi install npm:pi-ask-user` adds an interactive `ask_user` tool for collecting user decisions during an agent run.
 - pi-bar - `pi install npm:pi-bar` pi-bar keeps your model, thinking level, context pressure, a live progress update, and any extension statuses visible in pi's footer.
+- pi-codex-conversion - `pi install npm:@howaboua/pi-codex-conversion` adds Codex-shaped tools and prompt handling for Codex-like GPT models, plus optional web, image, voice, and compaction features. Configure it with `/codex`.
 - pi-codex-goal - `pi install npm:pi-codex-goal` Codex-style goal tracking for pi.
 - pi-subagents - `pi install npm:pi-subagents` `lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
-

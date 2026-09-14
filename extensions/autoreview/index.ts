@@ -61,6 +61,10 @@ type OnUpdateCallback = (partial: AgentToolResult<ReviewDetails>) => void;
 
 const MAX_REVIEWERS = 3;
 
+// Default model for spawned reviewer children (instead of inheriting the
+// parent session's model). Kept cheap/fast for the common single-pass review.
+const DEFAULT_REVIEWER_MODEL = "zai/glm-5.3-flash";
+
 // -- Helpers --
 
 function formatTokens(n: number): string {
@@ -594,9 +598,7 @@ export default function (pi: ExtensionAPI) {
         const extraPrompt = params.prompt ? `\n\nAdditional review focus:\n${params.prompt}` : "";
         const fullDiff = hasDiff ? diff + extraPrompt : "";
 
-        // Inherit the parent session's model.
-        const currentModel = ctx.getModel?.();
-        const modelFlag = currentModel ? `${currentModel.provider}/${currentModel.id}` : undefined;
+        const modelFlag = DEFAULT_REVIEWER_MODEL;
 
         const details = await runReview({
           cwd: reviewCwd,
