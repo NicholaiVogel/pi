@@ -11,7 +11,7 @@ git clone https://github.com/NicholaiVogel/pi.git ~/.pi/agent
 The files in here are of course the ones I've made myself, or rather, my agent made them, per my verbal harassment and belittling:
 
 - **loop** - `/loop` adds a claude code style loop command, for when you need loops, because you think you're a forward deployed loop engineer, and you have no friends or loved ones.
-- **autoreview** - `/review` spawns an isolated child pi reviewer that inherits the active model, auto-detects what to review (local/branch/commit), and returns structured findings with severity, file, line, and suggested fixes.
+- **autoreview** - `/review` launches an isolated child pi reviewer in the background during interactive sessions, auto-detects what to review (local/branch/commit), and wakes the main agent with structured findings when it finishes. Use `--foreground` when a blocking review is explicitly needed; print/JSON runs stay foreground automatically.
 - **web** - adds web search thru searxng and lightpanda
 
 And then some I yoinked from [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup) because why write when you can steal:
