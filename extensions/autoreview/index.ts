@@ -18,6 +18,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -26,7 +27,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import { REVIEW_PROMPT } from "./prompt.js";
 import { type Finding, type Severity, parseFindings, unionFindings, proseAfterJson } from "./findings.js";
 
@@ -42,12 +43,14 @@ interface ReviewerResult {
 }
 
 interface ReviewDetails {
+  runId?: string;
+  execution?: "background" | "foreground";
   mode: string;
   base?: string;
   commit?: string;
   reviewers: number;
-  /** "running" while any child reviewer is still active, "done" once all have exited. */
-  status: "running" | "done";
+  /** "started" is a settled async launch card; completion arrives separately. */
+  status: "started" | "running" | "done";
   diffStat: string;
   findings: Finding[];
   summary: string;
@@ -58,12 +61,65 @@ interface ReviewDetails {
 }
 
 type OnUpdateCallback = (partial: AgentToolResult<ReviewDetails>) => void;
+type ReviewToolResult = AgentToolResult<ReviewDetails> & { isError?: boolean };
 
 const MAX_REVIEWERS = 3;
+const AUTOREVIEW_COMPLETE_EVENT = "autoreview:complete";
+const BACKGROUND_WORK_REGISTRY_KEY = "pi-subagents.background-work.v1";
+const BACKGROUND_WORK_PROTOCOL_VERSION = 1;
+const MAX_NOTIFICATION_CHARS = 50_000;
 
 // Default model for spawned reviewer children (instead of inheriting the
 // parent session's model). Kept cheap/fast for the common single-pass review.
 const DEFAULT_REVIEWER_MODEL = "zai/glm-5.3-flash";
+
+interface BackgroundReviewJob {
+  id: string;
+  sessionId: string;
+  controller: AbortController;
+}
+
+interface BackgroundWorkRegistry {
+  version: number;
+  providers: Map<string, unknown>;
+}
+
+/**
+ * Register with pi-subagents' process-local wait protocol without taking a
+ * runtime dependency on that optional package. Both extensions meet through
+ * the documented Symbol.for registry when pi-subagents is installed.
+ */
+function registerBackgroundWorkProvider(
+  jobs: Map<string, BackgroundReviewJob>,
+): () => void {
+  const key = Symbol.for(BACKGROUND_WORK_REGISTRY_KEY);
+  const target = globalThis as Record<PropertyKey, unknown>;
+  let registry = target[key] as BackgroundWorkRegistry | undefined;
+
+  // pi-subagents creates this v1 registry lazily on first use. Seed the same
+  // documented shape so autoreview can be the first background-work provider.
+  if (registry === undefined) {
+    registry = { version: BACKGROUND_WORK_PROTOCOL_VERSION, providers: new Map() };
+    target[key] = registry;
+  }
+
+  // Async review still works without wait integration if an incompatible
+  // protocol has already claimed the shared registry.
+  if (registry.version !== BACKGROUND_WORK_PROTOCOL_VERSION || !(registry.providers instanceof Map)) {
+    return () => {};
+  }
+
+  const provider = {
+    name: "autoreview",
+    wakeChannels: [AUTOREVIEW_COMPLETE_EVENT],
+    listActiveWork: () => [...jobs.values()].map((job) => ({ id: job.id, sessionId: job.sessionId })),
+  };
+  registry.providers.set(provider.name, provider);
+
+  return () => {
+    if (registry?.providers.get(provider.name) === provider) registry.providers.delete(provider.name);
+  };
+}
 
 // -- Helpers --
 
@@ -365,7 +421,10 @@ async function runSingleReviewer(opts: SingleReviewerOpts): Promise<ReviewerResu
       const kill = () => {
         wasAborted = true;
         proc.kill("SIGTERM");
-        setTimeout(() => { if (!proc.killed) proc.kill("SIGKILL"); }, 5000);
+        const killTimer = setTimeout(() => {
+          if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+        }, 5000);
+        killTimer.unref?.();
       };
       if (opts.signal.aborted) kill();
       else opts.signal.addEventListener("abort", kill, { once: true });
@@ -388,6 +447,8 @@ async function runSingleReviewer(opts: SingleReviewerOpts): Promise<ReviewerResu
 // -- Orchestrator (handles the ensemble) --
 
 interface ReviewRunOpts {
+  runId?: string;
+  execution?: "background" | "foreground";
   cwd: string;
   diff: string;
   stat: string;
@@ -405,6 +466,8 @@ interface ReviewRunOpts {
 
 async function runReview(opts: ReviewRunOpts): Promise<ReviewDetails> {
   const details: ReviewDetails = {
+    runId: opts.runId,
+    execution: opts.execution,
     mode: opts.mode,
     base: opts.base,
     commit: opts.commit,
@@ -569,74 +632,238 @@ const ReviewParams = Type.Object({
     minimum: 1,
     maximum: MAX_REVIEWERS,
   })),
+  async: Type.Optional(Type.Boolean({
+    description: "Run in the background and notify the main agent when complete (default in interactive/RPC sessions: true). Print and JSON modes always run in the foreground so their output is not lost. Set false when the current tool call must block for the findings.",
+    default: true,
+  })),
 });
 
+type ReviewParamsValue = Static<typeof ReviewParams>;
+
+function normalizeReviewerCount(value: number | undefined): number {
+  const raw = value != null ? Number(value) : 1;
+  return Number.isFinite(raw) ? Math.max(1, Math.min(MAX_REVIEWERS, Math.floor(raw))) : 1;
+}
+
+function errorResult(
+  params: ReviewParamsValue,
+  reviewers: number,
+  error: unknown,
+  runId?: string,
+  execution: "background" | "foreground" = "foreground",
+): ReviewToolResult {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    content: [{ type: "text", text: `Review failed: ${message}` }],
+    details: {
+      runId,
+      execution,
+      mode: params.mode ?? "auto",
+      base: params.base,
+      commit: params.commit,
+      reviewers,
+      status: "done",
+      diffStat: "",
+      findings: [],
+      summary: `Error: ${message}`,
+      rawOutput: "",
+      exitCode: 1,
+      usage: { input: 0, output: 0, cost: 0 },
+    },
+    isError: true,
+  };
+}
+
+async function executeReview(
+  params: ReviewParamsValue,
+  defaultCwd: string,
+  signal: AbortSignal | undefined,
+  onUpdate: OnUpdateCallback | undefined,
+  runId?: string,
+  execution: "background" | "foreground" = "foreground",
+): Promise<ReviewToolResult> {
+  const mode = params.mode ?? "auto";
+  const reviewCwd = params.cwd || defaultCwd;
+  const reviewers = normalizeReviewerCount(params.reviewers);
+
+  try {
+    const { diff, stat, resolvedMode, resolvedBase } = await gatherDiff(reviewCwd, mode, params.base, params.commit);
+    const hasDiff = diff.trim().length > 0;
+    const extraPrompt = params.prompt ? `\n\nAdditional review focus:\n${params.prompt}` : "";
+    const fullDiff = hasDiff ? diff + extraPrompt : "";
+
+    const details = await runReview({
+      runId,
+      execution,
+      cwd: reviewCwd,
+      diff: fullDiff,
+      stat,
+      mode: resolvedMode,
+      base: resolvedBase,
+      commit: params.commit,
+      signal,
+      onUpdate,
+      modelFlag: DEFAULT_REVIEWER_MODEL,
+      prompt: params.prompt,
+      files: params.files,
+      hasDiff,
+      reviewers,
+    });
+
+    return {
+      content: [{ type: "text", text: details.rawOutput || details.summary }],
+      details,
+    };
+  } catch (error) {
+    return errorResult(params, reviewers, error, runId, execution);
+  }
+}
+
+function truncateNotification(value: string): string {
+  if (value.length <= MAX_NOTIFICATION_CHARS) return value;
+  return `${value.slice(0, MAX_NOTIFICATION_CHARS)}\n\n[Review output truncated at ${MAX_NOTIFICATION_CHARS} characters.]`;
+}
+
+export function formatBackgroundCompletion(result: ReviewToolResult): string {
+  const details = result.details;
+  const failed = result.isError || details.exitCode !== 0;
+  const heading = failed ? "Background autoreview failed" : "Background autoreview completed";
+  const output = result.content
+    .filter((part): part is Extract<(typeof result.content)[number], { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+
+  return truncateNotification([
+    `${heading} (run ${details.runId ?? "unknown"}, ${details.mode}${details.reviewers > 1 ? ` ×${details.reviewers}` : ""}).`,
+    "The review used the working-tree snapshot captured when it launched. Verify file and line references against any edits made since then.",
+    "Incorporate actionable findings into the current task. If fixes change the reviewed code, launch one follow-up autoreview; do not block the interactive thread waiting for it.",
+    "",
+    output || details.summary,
+  ].join("\n"));
+}
+
 export default function (pi: ExtensionAPI) {
+  const backgroundJobs = new Map<string, BackgroundReviewJob>();
+  let disposeBackgroundProvider = () => {};
+  let currentSessionId: string | null = null;
+  let acceptingCompletions = true;
+
+  pi.on("session_start", (_event, ctx) => {
+    currentSessionId = ctx.sessionManager.getSessionId() || null;
+    acceptingCompletions = true;
+    disposeBackgroundProvider();
+    // Register per session so shutdown/reload can revoke ownership cleanly.
+    disposeBackgroundProvider = registerBackgroundWorkProvider(backgroundJobs);
+  });
+
+  pi.on("session_shutdown", () => {
+    acceptingCompletions = false;
+    currentSessionId = null;
+    for (const job of backgroundJobs.values()) job.controller.abort();
+    backgroundJobs.clear();
+    disposeBackgroundProvider();
+    disposeBackgroundProvider = () => {};
+  });
+
+  const deliverBackgroundResult = (
+    runId: string,
+    sessionId: string,
+    result: ReviewToolResult,
+  ) => {
+    backgroundJobs.delete(runId);
+    if (!acceptingCompletions || currentSessionId !== sessionId) return;
+
+    const success = !result.isError && result.details.exitCode === 0;
+    pi.events.emit(AUTOREVIEW_COMPLETE_EVENT, { id: runId, sessionId, success });
+
+    try {
+      pi.sendMessage(
+        {
+          customType: "autoreview-notify",
+          content: formatBackgroundCompletion(result),
+          display: true,
+          details: result.details,
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    } catch (error) {
+      console.error(`Failed to deliver autoreview completion '${runId}':`, error);
+    }
+  };
+
   pi.registerTool({
     name: "autoreview",
     label: "Auto Review",
-    description: "Run structured, adversarial code review using an isolated reviewer with read+investigate tools (read, ls, find, grep, bash, web_search). Returns findings with severity, file, line, and suggested fixes. Defaults to a single thorough pass — cheap and sufficient for almost all work. Pass reviewers=3 ONLY when the user explicitly asks for a deep/thorough review of high-risk changes. Pass cwd to review a different repo.",
-    promptSnippet: "Run adversarial structured code review on changes and return actionable findings",
+    description: "Run structured, adversarial code review using an isolated reviewer with read+investigate tools (read, ls, find, grep, bash, web_search). In interactive/RPC sessions, background execution is the default: the tool returns immediately, then notifies and wakes the main agent with structured findings. Print/JSON modes stay foreground so output is preserved. Set async=false when the current tool call must block. Defaults to one thorough reviewer; pass reviewers=3 ONLY when the user explicitly asks for a deep/thorough review.",
+    promptSnippet: "Launch adversarial code review in the background and notify the main agent on completion",
     promptGuidelines: [
       "Use autoreview after non-trivial code edits, before committing, or when the user asks for a review. It spawns an isolated reviewer with its own context window — it cannot see your conversation.",
       "IMPORTANT: Default to a single reviewer (reviewers=1). One thorough pass is enough for ~90% of work and keeps usage low. Do NOT raise reviewers on your own initiative based on change size or perceived risk — only use reviewers=3 when the user explicitly asks for a deep / thorough / extra-careful review, since it costs ~3x usage.",
-      "After fixing findings from autoreview, run it again (still reviewers=1) to verify the fix and catch regressions.",
+      "Autoreview runs asynchronously by default in interactive/RPC sessions and stays synchronous in print/JSON modes. After a background launch, continue other useful work or return control to the user; do not poll or block merely to wait. Pi will wake the main agent with a follow-up completion message.",
+      "When an autoreview completion message arrives, verify findings against the current working tree and address actionable issues. After fixing findings, launch one follow-up autoreview (still reviewers=1) to verify the fix.",
     ],
     parameters: ReviewParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const mode = params.mode ?? "auto";
-      const reviewCwd = params.cwd || ctx.cwd;
+      const reviewers = normalizeReviewerCount(params.reviewers);
 
-      const reviewersRaw = params.reviewers != null ? Number(params.reviewers) : 1;
-      const reviewers = Number.isFinite(reviewersRaw) ? Math.max(1, Math.min(MAX_REVIEWERS, Math.floor(reviewersRaw))) : 1;
-
-      try {
-        const { diff, stat, resolvedMode, resolvedBase } = await gatherDiff(reviewCwd, mode, params.base, params.commit);
-        const hasDiff = diff.trim().length > 0;
-
-        const extraPrompt = params.prompt ? `\n\nAdditional review focus:\n${params.prompt}` : "";
-        const fullDiff = hasDiff ? diff + extraPrompt : "";
-
-        const modelFlag = DEFAULT_REVIEWER_MODEL;
-
-        const details = await runReview({
-          cwd: reviewCwd,
-          diff: fullDiff,
-          stat,
-          mode: resolvedMode,
-          base: resolvedBase,
-          commit: params.commit,
-          signal,
-          onUpdate,
-          modelFlag,
-          prompt: params.prompt,
-          files: params.files,
-          hasDiff,
-          reviewers,
-        });
-
-        return {
-          content: [{ type: "text", text: details.rawOutput || details.summary }],
-          details,
-        };
-      } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `Review failed: ${err.message}` }],
-          details: {
-            mode: mode === "auto" ? "auto" : mode, base: params.base, commit: params.commit,
-            reviewers, status: "done", diffStat: "", findings: [], summary: `Error: ${err.message}`,
-            rawOutput: "", exitCode: 1, usage: { input: 0, output: 0, cost: 0 },
-          },
-          isError: true,
-        };
+      const backgroundRequested = params.async !== false;
+      const backgroundSupported = ctx.mode !== "print" && ctx.mode !== "json" && ctx.hasUI;
+      if (!backgroundRequested || !backgroundSupported) {
+        return executeReview(params, ctx.cwd, signal, onUpdate, undefined, "foreground");
       }
+
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (!sessionId) {
+        return errorResult(params, reviewers, "Background review requires an active session identity.");
+      }
+
+      const runId = `review-${randomUUID().slice(0, 8)}`;
+      const controller = new AbortController();
+      const reviewCwd = ctx.cwd;
+      const job: BackgroundReviewJob = { id: runId, sessionId, controller };
+      backgroundJobs.set(runId, job);
+
+      setImmediate(() => {
+        void executeReview(params, reviewCwd, controller.signal, undefined, runId, "background")
+          .then((result) => deliverBackgroundResult(runId, sessionId, result))
+          .catch((error) => {
+            const result = errorResult(params, reviewers, error, runId, "background");
+            deliverBackgroundResult(runId, sessionId, result);
+          });
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: `Background autoreview started (run ${runId}). Continue with other useful work or return control to the user; while this Pi session remains active, the findings will arrive as a follow-up message when the review completes.`,
+        }],
+        details: {
+          runId,
+          execution: "background",
+          mode,
+          base: params.base,
+          commit: params.commit,
+          reviewers,
+          status: "started",
+          diffStat: "",
+          findings: [],
+          summary: `Background review ${runId} is running…`,
+          rawOutput: "",
+          exitCode: 0,
+          model: DEFAULT_REVIEWER_MODEL,
+          usage: { input: 0, output: 0, cost: 0 },
+        },
+      };
     },
 
     renderCall(args, theme) {
       const mode = args.mode ?? "auto";
       let text = theme.fg("toolTitle", theme.bold("autoreview ")) + theme.fg("accent", mode);
       if (args.reviewers && args.reviewers > 1) text += theme.fg("accent", ` ×${args.reviewers}`);
+      if (args.async === false) text += theme.fg("muted", " --foreground");
       if (args.cwd) text += theme.fg("muted", ` --cwd ${args.cwd}`);
       if (args.base) text += theme.fg("muted", ` --base ${args.base}`);
       if (args.commit) text += theme.fg("muted", ` --commit ${args.commit}`);
@@ -653,8 +880,11 @@ export default function (pi: ExtensionAPI) {
       const mdTheme = getMarkdownTheme();
       const hasFindings = details.findings.length > 0;
       const isRunning = details.status === "running";
+      const isBackgroundLaunch = details.status === "started";
 
-      const icon = isRunning
+      const icon = isBackgroundLaunch
+        ? theme.fg("accent", "↗")
+        : isRunning
         ? theme.fg("accent", "◐")
         : result.isError
           ? theme.fg("error", "✗")
@@ -670,6 +900,7 @@ export default function (pi: ExtensionAPI) {
         header += theme.fg("muted", ` (${details.mode})`);
         if (details.reviewers > 1) header += theme.fg("accent", ` ×${details.reviewers}`);
         if (isRunning) header += theme.fg("accent", " · in progress");
+        if (isBackgroundLaunch) header += theme.fg("accent", " · launched in background");
         if (details.diffStat) {
           const statLine = details.diffStat.split("\n").pop() || "";
           header += theme.fg("dim", ` ${statLine.trim()}`);
@@ -691,9 +922,11 @@ export default function (pi: ExtensionAPI) {
               container.addChild(new Text(theme.fg("dim", `   → ${f.suggested_fix}`), 0, 0));
             }
           }
-        } else if (isRunning) {
+        } else if (isRunning || isBackgroundLaunch) {
           container.addChild(new Spacer(1));
-          container.addChild(new Text(theme.fg("accent", "Reviewers are still running — no findings yet."), 0, 0));
+          container.addChild(new Text(theme.fg("accent", isBackgroundLaunch
+            ? `Completion for ${details.runId ?? "this review"} arrives while this Pi session remains active.`
+            : "Reviewers are still running — no findings yet."), 0, 0));
         }
 
         // Full output as markdown
@@ -743,6 +976,8 @@ export default function (pi: ExtensionAPI) {
         if (details.findings.length > 5) {
           text += `\n${theme.fg("muted", `  ... +${details.findings.length - 5} more`)}`;
         }
+      } else if (isBackgroundLaunch) {
+        text += `\n${theme.fg("accent", `Launched in background${details.runId ? ` · ${details.runId}` : ""}`)}`;
       } else if (isRunning) {
         text += `\n${theme.fg("accent", "Review in progress…")}`;
       } else {
@@ -756,25 +991,29 @@ export default function (pi: ExtensionAPI) {
 
   // /review command — delegates to the agent to call the autoreview tool.
   // Default: single reviewer (cheap). Supports: mode, --base <ref>, --commit <ref>,
-  // --reviewers <n> (max 3), and --deep/--thorough (alias for --reviewers 3).
+  // --reviewers <n> (max 3), --deep/--thorough (alias for --reviewers 3), and
+  // --foreground/--sync to opt out of the default background execution.
   pi.registerCommand("review", {
-    description: "Run structured code review — auto-detects local/branch/commit changes. Default is a single thorough reviewer (cheap). Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>, --reviewers <n> (max 3), --deep (alias for --reviewers 3, for high-risk changes; costs ~3x usage)",
+    description: "Launch structured code review in the background and notify the main agent on completion. Args: mode (auto|local|branch|commit), --base <ref>, --commit <ref>, --reviewers <n> (max 3), --deep (3 reviewers), --foreground/--sync (block instead)",
     handler: async (args, _ctx) => {
       const argStr = (args || "").trim();
       const modeMatch = argStr.match(/\b(auto|local|branch|commit)\b/);
       const mode = modeMatch ? modeMatch[1] : "auto";
-      const baseMatch = argStr.match(/--base\s+(\S+)/);
-      const commitMatch = argStr.match(/--commit\s+(\S+)/);
-      const reviewersMatch = argStr.match(/--reviewers\s+(\d+)/);
+      const baseMatch = argStr.match(/(?:^|\s)--base\s+(\S+)/);
+      const commitMatch = argStr.match(/(?:^|\s)--commit\s+(\S+)/);
+      const reviewersMatch = argStr.match(/(?:^|\s)--reviewers\s+(\d+)/);
+      const foreground = /(?:^|\s)--(?:foreground|sync)\b/.test(argStr);
 
       let reviewers = 1;
-      if (/\b--deep\b|\b--panel\b|\b--thorough\b/.test(argStr)) reviewers = 3;
+      if (/(?:^|\s)--(?:deep|panel|thorough)\b/.test(argStr)) reviewers = 3;
       else if (reviewersMatch) reviewers = Math.max(1, Math.min(MAX_REVIEWERS, parseInt(reviewersMatch[1], 10) || 1));
 
       let prompt = `Run a code review using the autoreview tool with mode "${mode}".`;
       if (baseMatch) prompt += ` Use base "${baseMatch[1]}".`;
       if (commitMatch) prompt += ` Review commit "${commitMatch[1]}".`;
       if (reviewers > 1) prompt += ` Use reviewers=${reviewers} (user explicitly requested deep review).`;
+      if (foreground) prompt += " Pass async=false and wait for the result in this turn.";
+      else prompt += " Launch it asynchronously (the default), then continue useful work or return control; the completion will wake you.";
 
       pi.sendUserMessage(prompt, { deliverAs: "followUp" });
     },
